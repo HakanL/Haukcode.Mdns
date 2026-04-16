@@ -4,6 +4,9 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
+  <Folder Name="/samples/">
+    <Project Path="../samples/Mdns.Sample/Mdns.Sample.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="../tests/Mdns.Tests/Mdns.Tests.csproj" />
   </Folder>
