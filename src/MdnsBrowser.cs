@@ -1,0 +1,273 @@
+namespace Haukcode.Mdns;
+
+/// <summary>
+/// Browses for DNS-SD services via mDNS (RFC 6762 + RFC 6763).
+///
+/// Usage:
+///   1. Subscribe to <see cref="ServiceFound"/> and/or <see cref="ServiceLost"/>
+///   2. Call <see cref="Start"/> — sends an initial PTR query and listens continuously
+///   3. Call <see cref="Dispose"/> to stop
+///
+/// Services are considered lost when their PTR TTL expires and they are not refreshed.
+/// </summary>
+public sealed class MdnsBrowser : IDisposable
+{
+    private readonly string serviceType; // e.g. "_apple-midi._udp.local."
+    private readonly MulticastTransport transport;
+    private readonly Timer expiryTimer;
+    private readonly object mutex = new();
+
+    private readonly Dictionary<string, DiscoveredService> services = new(StringComparer.OrdinalIgnoreCase);
+
+    private bool disposed;
+
+    // -------------------------------------------------------------------------
+    // Events
+    // -------------------------------------------------------------------------
+
+    public event Action<ServiceProfile>? ServiceFound;
+    public event Action<ServiceProfile>? ServiceLost;
+
+    // -------------------------------------------------------------------------
+    // Construction
+    // -------------------------------------------------------------------------
+
+    /// <param name="serviceType">
+    /// Service type to browse, e.g. "_apple-midi._udp" or "_osc._udp".
+    /// Do not include ".local." — it is appended automatically.
+    /// </param>
+    public MdnsBrowser(string serviceType)
+    {
+        this.serviceType = serviceType.EndsWith(".local.", StringComparison.OrdinalIgnoreCase)
+            ? serviceType
+            : serviceType + ".local.";
+
+        transport = new MulticastTransport();
+        transport.PacketReceived += OnPacketReceived;
+
+        expiryTimer = new Timer(OnExpiryTimer, null, Timeout.Infinite, Timeout.Infinite);
+    }
+
+    // -------------------------------------------------------------------------
+    // Public API
+    // -------------------------------------------------------------------------
+
+    public void Start()
+    {
+        transport.Start();
+        SendQuery();
+        expiryTimer.Change(1000, 1000);
+    }
+
+    public IReadOnlyList<ServiceProfile> CurrentServices()
+    {
+        lock (mutex)
+            return services.Values
+                .Where(s => s.IsComplete)
+                .Select(s => s.ToProfile())
+                .ToList();
+    }
+
+    // -------------------------------------------------------------------------
+    // Expiry timer
+    // -------------------------------------------------------------------------
+
+    private void OnExpiryTimer(object? _)
+    {
+        List<DiscoveredService>? expired = null;
+
+        lock (mutex)
+        {
+            foreach (var svc in services.Values)
+            {
+                if (svc.IsExpired())
+                {
+                    expired ??= [];
+                    expired.Add(svc);
+                }
+            }
+
+            if (expired != null)
+                foreach (var svc in expired)
+                    services.Remove(svc.InstanceName);
+        }
+
+        if (expired != null)
+            foreach (var svc in expired)
+                if (svc.IsComplete)
+                    ServiceLost?.Invoke(svc.ToProfile());
+    }
+
+    // -------------------------------------------------------------------------
+    // Receive
+    // -------------------------------------------------------------------------
+
+    private void OnPacketReceived(byte[] data, IPEndPoint remote)
+    {
+        if (!DnsParser.TryParse(data, out var msg) || msg == null || !msg.IsResponse)
+            return;
+
+        var allRecords = msg.Answers.Concat(msg.Authorities).Concat(msg.Additionals).ToList();
+
+        bool changed = false;
+
+        lock (mutex)
+        {
+            foreach (var record in allRecords)
+            {
+                switch (record.Type)
+                {
+                    case DnsRecordType.PTR when
+                        string.Equals(record.Name, serviceType, StringComparison.OrdinalIgnoreCase):
+                    {
+                        var instanceName = DnsParser.ParsePtr(record.Data, data);
+                        // Strip the service type suffix to get just the instance name
+                        var shortName = StripServiceType(instanceName);
+                        if (shortName == null) break;
+
+                        var svc = GetOrCreate(shortName);
+                        svc.PtrTtl = record.Ttl;
+                        svc.PtrExpiry = DateTime.UtcNow.AddSeconds(record.Ttl);
+                        changed = true;
+                        break;
+                    }
+
+                    case DnsRecordType.SRV:
+                    {
+                        var shortName = StripServiceType(record.Name);
+                        if (shortName == null) break;
+
+                        var (_, _, port, target) = DnsParser.ParseSrv(record.Data, data);
+                        var svc = GetOrCreate(shortName);
+                        svc.Port     = port;
+                        svc.Hostname = target;
+                        changed = true;
+                        break;
+                    }
+
+                    case DnsRecordType.TXT:
+                    {
+                        var shortName = StripServiceType(record.Name);
+                        if (shortName == null) break;
+
+                        var svc = GetOrCreate(shortName);
+                        svc.Properties = DnsParser.ParseTxt(record.Data);
+                        changed = true;
+                        break;
+                    }
+
+                    case DnsRecordType.A:
+                    {
+                        // Match by hostname against known services
+                        var ip = DnsParser.ParseA(record.Data);
+                        if (ip == null) break;
+
+                        foreach (var svc in services.Values)
+                        {
+                            if (string.Equals(svc.Hostname, record.Name, StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(svc.Hostname, record.Name + ".", StringComparison.OrdinalIgnoreCase))
+                            {
+                                svc.Address = ip;
+                                changed = true;
+                            }
+                        }
+
+                        // Also try matching by remote endpoint as fallback
+                        foreach (var svc in services.Values.Where(s => s.Address == null))
+                        {
+                            svc.Address = remote.Address;
+                            changed = true;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (changed)
+            {
+                foreach (var svc in services.Values.Where(s => s.IsComplete && !s.Announced))
+                {
+                    svc.Announced = true;
+                    ServiceFound?.Invoke(svc.ToProfile());
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Query
+    // -------------------------------------------------------------------------
+
+    private void SendQuery()
+    {
+        var msg = new DnsMessage { IsResponse = false };
+        msg.Questions.Add(new DnsQuestion(serviceType, DnsRecordType.PTR, DnsClass.IN));
+        transport.Send(DnsEncoder.Encode(msg));
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    private DiscoveredService GetOrCreate(string instanceName)
+    {
+        if (!services.TryGetValue(instanceName, out var svc))
+            services[instanceName] = svc = new DiscoveredService(instanceName);
+        return svc;
+    }
+
+    private string? StripServiceType(string fullName)
+    {
+        // "MyDevice._apple-midi._udp.local." → "MyDevice"
+        var suffix = "." + serviceType;
+        if (fullName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            return fullName[..^suffix.Length];
+        // Already just the instance name (no suffix)
+        if (!fullName.Contains('.'))
+            return fullName;
+        return null;
+    }
+
+    // -------------------------------------------------------------------------
+    // IDisposable
+    // -------------------------------------------------------------------------
+
+    public void Dispose()
+    {
+        if (disposed) return;
+        disposed = true;
+
+        expiryTimer.Dispose();
+        transport.PacketReceived -= OnPacketReceived;
+        transport.Dispose();
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal state
+    // -------------------------------------------------------------------------
+
+    private sealed class DiscoveredService(string instanceName)
+    {
+        public string InstanceName { get; } = instanceName;
+        public ushort Port     { get; set; }
+        public string? Hostname { get; set; }
+        public IPAddress? Address { get; set; }
+        public Dictionary<string, string> Properties { get; set; } = [];
+        public uint PtrTtl    { get; set; }
+        public DateTime PtrExpiry { get; set; }
+        public bool Announced { get; set; }
+
+        public bool IsComplete => Port > 0 && Address != null;
+
+        public bool IsExpired() => PtrTtl > 0 && DateTime.UtcNow > PtrExpiry;
+
+        public ServiceProfile ToProfile() => new(
+            InstanceName,
+            string.Empty, // service type not needed in results
+            Port,
+            Properties)
+        {
+            Address = Address,
+        };
+    }
+}

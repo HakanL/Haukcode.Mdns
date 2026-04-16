@@ -1,0 +1,11 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/tests/">
+    <Project Path="../tests/Mdns.Tests/Mdns.Tests.csproj" />
+  </Folder>
+  <Project Path="Mdns.csproj" />
+</Solution>

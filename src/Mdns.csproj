@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Haukcode.Mdns</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+
+    <!-- NuGet Metadata -->
+    <PackageId>Haukcode.Mdns</PackageId>
+    <Version>0.99.99</Version>
+    <Title>Lightweight mDNS for .NET</Title>
+    <Authors>Hakan Lindestaf</Authors>
+    <Description>Lightweight mDNS (RFC 6762) and DNS-SD (RFC 6763) implementation in pure C# with no external dependencies. Supports service advertising (PTR/SRV/TXT/A) and browsing. Cross-platform: Windows, Linux ARM64, macOS.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>© Copyright 2026 Hakan Lindestaf</Copyright>
+    <PackageProjectUrl>https://github.com/HakanL/Haukcode.Mdns</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/HakanL/Haukcode.Mdns</RepositoryUrl>
+    <PackageTags>mdns bonjour zeroconf dns-sd multicast discovery advertise csharp dotnet</PackageTags>
+    <PackageReadmeFile>README_NUGET.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\README_NUGET.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>
