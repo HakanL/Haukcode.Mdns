@@ -117,7 +117,17 @@ internal sealed class MulticastTransport : IDisposable
             if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
 
             var ipProps = nic.GetIPProperties();
-            var ipv4Props = ipProps.GetIPv4Properties();
+            IPv4InterfaceProperties? ipv4Props;
+            try
+            {
+                ipv4Props = ipProps.GetIPv4Properties();
+            }
+            catch (NetworkInformationException)
+            {
+                // Some adapters (e.g. Hyper-V, tunnel, or partially-disabled)
+                // throw instead of returning null when IPv4 is not configured.
+                continue;
+            }
             if (ipv4Props == null) continue;
 
             if (!ipProps.UnicastAddresses.Any(u => u.Address.AddressFamily == AddressFamily.InterNetwork))
