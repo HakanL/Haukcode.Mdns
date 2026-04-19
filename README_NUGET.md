@@ -19,7 +19,7 @@ dotnet add package Haukcode.Mdns
 ## Advertise a service
 
 ```csharp
-var profile = new ServiceProfile("DMX Core 100", "_apple-midi._udp", port: 5004);
+var profile = new ServiceProfile("My Device", "_http._tcp", port: 80);
 
 using var advertiser = new MdnsAdvertiser(profile);
 advertiser.Start();
@@ -31,7 +31,7 @@ advertiser.Start();
 ## Browse for services
 
 ```csharp
-using var browser = new MdnsBrowser("_apple-midi._udp");
+using var browser = new MdnsBrowser("_http._tcp");
 
 browser.ServiceFound += svc =>
     Console.WriteLine($"Found: {svc.InstanceName} @ {svc.Port}");
