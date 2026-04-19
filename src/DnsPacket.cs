@@ -121,7 +121,15 @@ public static class DnsEncoder
         {
             foreach (var kv in properties)
             {
+                if (string.IsNullOrEmpty(kv.Key))
+                    throw new ArgumentException("TXT record key must not be empty.", nameof(properties));
+                if (kv.Key.Contains('='))
+                    throw new ArgumentException($"TXT record key '{kv.Key}' must not contain '=' (RFC 6763 §6.4).", nameof(properties));
+
                 var entry = Encoding.UTF8.GetBytes($"{kv.Key}={kv.Value}");
+                if (entry.Length > 255)
+                    throw new ArgumentException($"TXT record entry for key '{kv.Key}' exceeds 255 bytes.", nameof(properties));
+
                 w.WriteByte((byte)entry.Length);
                 w.WriteBytes(entry);
             }

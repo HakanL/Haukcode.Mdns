@@ -9,8 +9,9 @@ namespace Haukcode.Mdns;
 ///   3. Call <see cref="Dispose"/> to stop
 ///
 /// Services are considered lost when their PTR TTL expires and they are not refreshed.
+/// Re-queries are sent with exponential back-off (1 s → 2 s → 4 s … up to 1 h) per RFC 6762 §5.2.
 /// </summary>
-public sealed class MdnsBrowser : IDisposable
+public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
 {
     private readonly string serviceType; // e.g. "_apple-midi._udp.local."
     private readonly MulticastTransport transport;
@@ -19,7 +20,11 @@ public sealed class MdnsBrowser : IDisposable
 
     private readonly Dictionary<string, DiscoveredService> services = new(StringComparer.OrdinalIgnoreCase);
 
-    private bool disposed;
+    // Re-query back-off state (RFC 6762 §5.2)
+    private DateTime nextQueryTime = DateTime.MaxValue; // set on Start()
+    private int queryIntervalSeconds = 1;               // doubles up to 3600
+
+    private int disposed; // 0 = alive, 1 = disposed (Interlocked)
 
     // -------------------------------------------------------------------------
     // Events
@@ -56,6 +61,7 @@ public sealed class MdnsBrowser : IDisposable
     {
         transport.Start();
         SendQuery();
+        nextQueryTime = DateTime.UtcNow.AddSeconds(queryIntervalSeconds);
         expiryTimer.Change(1000, 1000);
     }
 
@@ -69,7 +75,7 @@ public sealed class MdnsBrowser : IDisposable
     }
 
     // -------------------------------------------------------------------------
-    // Expiry timer
+    // Expiry + re-query timer (fires every 1 s)
     // -------------------------------------------------------------------------
 
     private void OnExpiryTimer(object? _)
@@ -96,6 +102,14 @@ public sealed class MdnsBrowser : IDisposable
             foreach (var svc in expired)
                 if (svc.IsComplete)
                     ServiceLost?.Invoke(svc.ToProfile());
+
+        // Re-query with exponential back-off (RFC 6762 §5.2)
+        if (DateTime.UtcNow >= nextQueryTime)
+        {
+            SendQuery();
+            queryIntervalSeconds = Math.Min(queryIntervalSeconds * 2, 3600);
+            nextQueryTime = DateTime.UtcNow.AddSeconds(queryIntervalSeconds);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -212,7 +226,7 @@ public sealed class MdnsBrowser : IDisposable
     private DiscoveredService GetOrCreate(string instanceName)
     {
         if (!services.TryGetValue(instanceName, out var svc))
-            services[instanceName] = svc = new DiscoveredService(instanceName);
+            services[instanceName] = svc = new DiscoveredService(instanceName, serviceType);
         return svc;
     }
 
@@ -229,26 +243,33 @@ public sealed class MdnsBrowser : IDisposable
     }
 
     // -------------------------------------------------------------------------
-    // IDisposable
+    // IDisposable / IAsyncDisposable
     // -------------------------------------------------------------------------
 
     public void Dispose()
     {
-        if (disposed) return;
-        disposed = true;
+        if (Interlocked.CompareExchange(ref disposed, 1, 0) != 0)
+            return;
 
         expiryTimer.Dispose();
         transport.PacketReceived -= OnPacketReceived;
         transport.Dispose();
     }
 
+    public ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
+
     // -------------------------------------------------------------------------
     // Internal state
     // -------------------------------------------------------------------------
 
-    private sealed class DiscoveredService(string instanceName)
+    private sealed class DiscoveredService(string instanceName, string serviceType)
     {
         public string InstanceName { get; } = instanceName;
+        public string ServiceType  { get; } = serviceType;
         public ushort Port     { get; set; }
         public string? Hostname { get; set; }
         public IPAddress? Address { get; set; }
@@ -263,7 +284,7 @@ public sealed class MdnsBrowser : IDisposable
 
         public ServiceProfile ToProfile() => new(
             InstanceName,
-            string.Empty, // service type not needed in results
+            ServiceType,
             Port,
             Properties)
         {

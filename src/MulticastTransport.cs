@@ -175,24 +175,30 @@ internal sealed class MulticastTransport : IDisposable
     {
         var client = (UdpClient)result.AsyncState!;
 
+        byte[]? data = null;
+        IPEndPoint? remote = null;
+
         lock (mutex)
         {
             if (disposed) return;
 
             try
             {
-                IPEndPoint? remote = new(IPAddress.Any, 0);
-                var data = client.EndReceive(result, ref remote);
-                if (remote != null)
-                    PacketReceived?.Invoke(data, remote);
+                IPEndPoint? ep = new(IPAddress.Any, 0);
+                data = client.EndReceive(result, ref ep);
+                remote = ep;
             }
             catch (SocketException) { /* socket closed */ }
             catch (ObjectDisposedException) { return; }
 
-            // Re-arm
+            // Re-arm before invoking the event so we never miss a packet
             try { client.BeginReceive(ReceiveCallback, client); }
             catch (ObjectDisposedException) { }
         }
+
+        // Invoke outside the lock to prevent lock-order deadlocks with subscribers
+        if (data != null && remote != null)
+            PacketReceived?.Invoke(data, remote);
     }
 
     // -------------------------------------------------------------------------

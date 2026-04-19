@@ -41,9 +41,10 @@ public sealed class ServiceProfile
 
     /// <summary>
     /// Hostname used in SRV records: "DMX-Core-100.local."
-    /// Spaces replaced with hyphens per RFC 6763.
+    /// Per RFC 6763 §4.3, the label must consist only of letters, digits, and hyphens.
+    /// All other characters are replaced with hyphens, and leading/trailing hyphens are removed.
     /// </summary>
-    public string Hostname => $"{InstanceName.Replace(' ', '-')}.local.";
+    public string Hostname => $"{SanitizeHostLabel(InstanceName)}.local.";
 
     public ServiceProfile(string instanceName, string serviceType, ushort port,
         IReadOnlyDictionary<string, string>? properties = null)
@@ -52,5 +53,38 @@ public sealed class ServiceProfile
         ServiceType  = serviceType;
         Port         = port;
         Properties   = properties ?? new Dictionary<string, string>();
+    }
+
+    /// <summary>
+    /// Converts an arbitrary instance name into a valid DNS label (RFC 1123):
+    /// only [A-Za-z0-9-], runs of invalid characters collapsed into a single hyphen,
+    /// leading/trailing hyphens stripped.
+    /// </summary>
+    public static string SanitizeHostLabel(string name)
+    {
+        var sb = new System.Text.StringBuilder(name.Length);
+        bool lastWasHyphen = false;
+
+        foreach (char c in name)
+        {
+            if (char.IsAsciiLetterOrDigit(c))
+            {
+                sb.Append(c);
+                lastWasHyphen = false;
+            }
+            else if (!lastWasHyphen && sb.Length > 0)
+            {
+                // Replace any run of non-alphanumeric chars with a single hyphen,
+                // but never start the label with one.
+                sb.Append('-');
+                lastWasHyphen = true;
+            }
+        }
+
+        // Trim trailing hyphen that may have been appended for a non-alphanumeric tail
+        if (sb.Length > 0 && sb[^1] == '-')
+            sb.Length--;
+
+        return sb.Length > 0 ? sb.ToString() : "device";
     }
 }
