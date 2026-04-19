@@ -74,8 +74,8 @@ public sealed class ServiceProfile
             }
             else if (!lastWasHyphen && sb.Length > 0)
             {
-                // Replace any run of non-alphanumeric chars with a single hyphen,
-                // but never start the label with one.
+                // Replace any run of non-alphanumeric chars with a single hyphen.
+                // The sb.Length > 0 guard ensures the label never starts with a hyphen.
                 sb.Append('-');
                 lastWasHyphen = true;
             }
