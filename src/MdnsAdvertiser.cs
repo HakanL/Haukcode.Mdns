@@ -32,10 +32,11 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
     private readonly object mutex = new();
 
     /// <summary>
-    /// Signalled when the goodbye sequence completes so that Dispose/DisposeAsync
-    /// can release resources without blocking on Thread.Sleep.
+    /// Completed (TrySetResult) when the goodbye sequence finishes so that
+    /// Dispose/DisposeAsync can release resources without busy-waiting.
     /// </summary>
-    private readonly ManualResetEventSlim goodbyeDone = new(false);
+    private readonly TaskCompletionSource<bool> goodbyeDone =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     // -------------------------------------------------------------------------
     // Construction
@@ -150,7 +151,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
                     if (--countdown == 0)
                     {
                         state = AnnounceState.Idle;
-                        try { goodbyeDone.Set(); } catch (ObjectDisposedException) { }
+                        goodbyeDone.TrySetResult(true);
                         return; // done — no reschedule
                     }
                     break;
@@ -251,14 +252,15 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
     {
         BeginGoodbye();
         // Wait up to 2 s for the two goodbye packets to be sent
-        goodbyeDone.Wait(2000);
+        goodbyeDone.Task.Wait(2000);
         ReleaseResources();
     }
 
     public async ValueTask DisposeAsync()
     {
         BeginGoodbye();
-        await Task.Run(() => goodbyeDone.Wait(2000)).ConfigureAwait(false);
+        // Task.WaitAsync avoids blocking a thread pool thread (available since .NET 6)
+        await goodbyeDone.Task.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
         ReleaseResources();
     }
 
@@ -282,7 +284,6 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
         announceTimer.Dispose();
         transport.PacketReceived -= OnPacketReceived;
         transport.Dispose();
-        goodbyeDone.Dispose();
     }
 
     // -------------------------------------------------------------------------

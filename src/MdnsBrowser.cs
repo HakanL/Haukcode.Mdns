@@ -24,7 +24,9 @@ public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
     private DateTime nextQueryTime = DateTime.MaxValue; // set on Start()
     private int queryIntervalSeconds = 1;               // doubles up to 3600
 
-    private int disposed; // 0 = alive, 1 = disposed (Interlocked)
+    // Interlocked int used as a boolean: 0 = alive, 1 = disposed.
+    // int is required because Interlocked.CompareExchange has no bool overload.
+    private int disposed;
 
     // -------------------------------------------------------------------------
     // Events
