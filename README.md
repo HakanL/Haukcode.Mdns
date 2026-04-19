@@ -23,7 +23,7 @@ dotnet add package Haukcode.Mdns
 ## Advertise a service
 
 ```csharp
-var profile = new ServiceProfile("DMX Core 100", "_apple-midi._udp", port: 5004);
+var profile = new ServiceProfile("My Device", "_http._tcp", port: 80);
 
 using var advertiser = new MdnsAdvertiser(profile);
 advertiser.Start();
@@ -35,7 +35,7 @@ advertiser.Start();
 ## Browse for services
 
 ```csharp
-using var browser = new MdnsBrowser("_apple-midi._udp");
+using var browser = new MdnsBrowser("_http._tcp");
 
 browser.ServiceFound += svc =>
     Console.WriteLine($"Found: {svc.InstanceName} @ {svc.Port}");
@@ -52,13 +52,13 @@ browser.Start();
 
 | Property | Example |
 |---|---|
-| `InstanceName` | `DMX Core 100` |
-| `ServiceType` | `_apple-midi._udp` |
-| `Port` | `5004` |
+| `InstanceName` | `My Device` |
+| `ServiceType` | `_http._tcp` |
+| `Port` | `80` |
 | `Properties` | `{ "txtvers": "1" }` |
-| `FullServiceType` | `_apple-midi._udp.local.` |
-| `FullInstanceName` | `DMX Core 100._apple-midi._udp.local.` |
-| `Hostname` | `DMX-Core-100.local.` |
+| `FullServiceType` | `_http._tcp.local.` |
+| `FullInstanceName` | `My Device._http._tcp.local.` |
+| `Hostname` | `My-Device.local.` |
 
 ## Announce sequence
 
