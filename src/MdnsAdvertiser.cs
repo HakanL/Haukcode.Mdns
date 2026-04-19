@@ -3,17 +3,17 @@ namespace Haukcode.Mdns;
 /// <summary>
 /// Advertises a DNS-SD service via mDNS (RFC 6762 + RFC 6763).
 ///
-/// Announcement sequence (matches vendored ZeroConfigWatcher behavior):
+/// Announcement sequence:
 ///   1. Probe: send claim packet with SRV+A in the Authority section
-///   2. Announce x3: send full response with PTR+SRV+TXT+A+NSEC
+///   2. Announce x3: send full response with PTR+SRV+TXT+A
 ///   3. Steady state: re-announce at 50%, 90%, 95% of TTL
 ///   4. Respond to incoming PTR queries for the service type
-///   5. Goodbye: re-send with TTL=0 on dispose (x2)
+///   5. Goodbye: re-send with TTL=0 on dispose (x2, 500 ms apart)
 ///
 /// Note: Full name-conflict resolution (RFC 6762 §8) is not implemented.
 /// On a typical LAN with a single DMX controller this is acceptable.
 /// </summary>
-public sealed class MdnsAdvertiser : IDisposable
+public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
 {
     private const uint LongTtl  = 4500;
     private const uint ShortTtl = 120;
@@ -30,6 +30,12 @@ public sealed class MdnsAdvertiser : IDisposable
 
     private bool disposed;
     private readonly object mutex = new();
+
+    /// <summary>
+    /// Signalled when the goodbye sequence completes so that Dispose/DisposeAsync
+    /// can release resources without blocking on Thread.Sleep.
+    /// </summary>
+    private readonly ManualResetEventSlim goodbyeDone = new(false);
 
     // -------------------------------------------------------------------------
     // Construction
@@ -144,6 +150,7 @@ public sealed class MdnsAdvertiser : IDisposable
                     if (--countdown == 0)
                     {
                         state = AnnounceState.Idle;
+                        try { goodbyeDone.Set(); } catch (ObjectDisposedException) { }
                         return; // done — no reschedule
                     }
                     break;
@@ -237,29 +244,45 @@ public sealed class MdnsAdvertiser : IDisposable
     }
 
     // -------------------------------------------------------------------------
-    // IDisposable
+    // IDisposable / IAsyncDisposable
     // -------------------------------------------------------------------------
 
     public void Dispose()
+    {
+        BeginGoodbye();
+        // Wait up to 2 s for the two goodbye packets to be sent
+        goodbyeDone.Wait(2000);
+        ReleaseResources();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        BeginGoodbye();
+        await Task.Run(() => goodbyeDone.Wait(2000)).ConfigureAwait(false);
+        ReleaseResources();
+    }
+
+    private void BeginGoodbye()
     {
         lock (mutex)
         {
             if (disposed) return;
             disposed = true;
 
-            // Start goodbye sequence
+            // Send first goodbye immediately, then let the timer send the second
             transport.Send(DnsEncoder.Encode(BuildGoodbyeMessage()));
             state = AnnounceState.Goodbye1;
             countdown = 2;
             ScheduleTimer(500);
         }
+    }
 
-        // Wait briefly for goodbye packets to send before disposing transport
-        Thread.Sleep(1200);
-
+    private void ReleaseResources()
+    {
         announceTimer.Dispose();
         transport.PacketReceived -= OnPacketReceived;
         transport.Dispose();
+        goodbyeDone.Dispose();
     }
 
     // -------------------------------------------------------------------------

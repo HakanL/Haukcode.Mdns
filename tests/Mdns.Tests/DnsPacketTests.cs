@@ -91,6 +91,20 @@ public class DnsPacketTests
         Assert.Equal("Test Device", parsed["name"]);
     }
 
+    [Fact]
+    public void Txt_KeyContainsEquals_Throws()
+    {
+        var props = new Dictionary<string, string> { ["bad=key"] = "value" };
+        Assert.Throws<ArgumentException>(() => DnsEncoder.BuildTxt(props));
+    }
+
+    [Fact]
+    public void Txt_EmptyKey_Throws()
+    {
+        var props = new Dictionary<string, string> { [""] = "value" };
+        Assert.Throws<ArgumentException>(() => DnsEncoder.BuildTxt(props));
+    }
+
     // -------------------------------------------------------------------------
     // A record
     // -------------------------------------------------------------------------
@@ -158,5 +172,30 @@ public class DnsPacketTests
         Assert.Equal("_apple-midi._udp.local.",                   profile.FullServiceType);
         Assert.Equal("DMX Core 100._apple-midi._udp.local.",      profile.FullInstanceName);
         Assert.Equal("DMX-Core-100.local.",                       profile.Hostname);
+    }
+
+    // -------------------------------------------------------------------------
+    // Hostname sanitization
+    // -------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("DMX Core 100",      "DMX-Core-100")]
+    [InlineData("My (Device) v2!",   "My-Device-v2")]
+    [InlineData("A/B\\C",            "A-B-C")]
+    [InlineData("---",               "device")]       // all hyphens → fallback
+    [InlineData("Hello World",       "Hello-World")]
+    [InlineData("no-change",         "no-change")]
+    [InlineData("trailing ",         "trailing")]     // trailing space → no trailing hyphen
+    public void SanitizeHostLabel_Produces_ValidDnsLabel(string input, string expected)
+    {
+        Assert.Equal(expected, ServiceProfile.SanitizeHostLabel(input));
+    }
+
+    [Fact]
+    public void ServiceProfile_Hostname_NoTrailingHyphen()
+    {
+        var profile = new ServiceProfile("Device!", "_test._udp", 1234);
+        Assert.False(profile.Hostname.StartsWith('.'));
+        Assert.False(profile.Hostname[..^".local.".Length].EndsWith('-'));
     }
 }
