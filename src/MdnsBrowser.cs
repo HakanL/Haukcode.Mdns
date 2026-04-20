@@ -208,6 +208,12 @@ public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
                 }
             }
         }
+
+        // Outside the lock: fire off follow-up queries for any services
+        // still missing port/address. Safe to call repeatedly; questions
+        // for already-resolved data simply won't be emitted.
+        if (changed)
+            SendFollowUpQueries();
     }
 
     // -------------------------------------------------------------------------
@@ -218,6 +224,48 @@ public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
     {
         var msg = new DnsMessage { IsResponse = false };
         msg.Questions.Add(new DnsQuestion(serviceType, DnsRecordType.PTR, DnsClass.IN));
+        transport.Send(DnsEncoder.Encode(msg));
+    }
+
+    /// <summary>
+    /// Send targeted SRV/A queries for any known-but-incomplete services.
+    /// Some responders (notably lwIP's built-in mDNS responder on embedded
+    /// devices) only return the PTR record in response to the initial PTR
+    /// query and expect the client to follow up with SRV / A queries. macOS
+    /// mDNSResponder bundles everything into one packet so the slower path
+    /// was easy to miss. This method closes the gap.
+    /// </summary>
+    private void SendFollowUpQueries()
+    {
+        List<DnsQuestion>? questions = null;
+
+        lock (mutex)
+        {
+            foreach (var svc in services.Values)
+            {
+                // Need SRV if we have the instance but no port yet.
+                if (svc.Port == 0)
+                {
+                    questions ??= [];
+                    questions.Add(new DnsQuestion(
+                        svc.InstanceName + "." + serviceType,
+                        DnsRecordType.SRV, DnsClass.IN));
+                }
+
+                // Need A if SRV gave us a hostname but no address yet.
+                if (svc.Address == null && !string.IsNullOrEmpty(svc.Hostname))
+                {
+                    questions ??= [];
+                    questions.Add(new DnsQuestion(svc.Hostname!,
+                        DnsRecordType.A, DnsClass.IN));
+                }
+            }
+        }
+
+        if (questions == null) return;
+
+        var msg = new DnsMessage { IsResponse = false };
+        foreach (var q in questions) msg.Questions.Add(q);
         transport.Send(DnsEncoder.Encode(msg));
     }
 

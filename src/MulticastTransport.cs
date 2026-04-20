@@ -11,7 +11,8 @@ internal sealed class MulticastTransport : IDisposable
     private const int MdnsPort = 5353;
 
     private readonly object mutex = new();
-    private UdpClient[]? clients;
+    private UdpClient[]? clients;       // bound to 5353, receive multicast announcements
+    private UdpClient[]? senders;       // bound to ephemeral, send queries and receive unicast replies
     private bool disposed;
 
     public event Action<byte[], IPEndPoint>? PacketReceived;
@@ -26,8 +27,11 @@ internal sealed class MulticastTransport : IDisposable
         {
             if (clients != null) return;
             clients = BuildClients();
+            senders = BuildSenderClients();
             foreach (var client in clients)
                 BeginReceive(client);
+            foreach (var sender in senders)
+                BeginReceive(sender);
         }
     }
 
@@ -45,10 +49,13 @@ internal sealed class MulticastTransport : IDisposable
         var ep = new IPEndPoint(MulticastGroup, MdnsPort);
         lock (mutex)
         {
-            if (clients == null) return;
-            foreach (var client in clients)
+            // Send from ephemeral-port sockets so unicast replies come back
+            // to a port only we hold (not Windows Bonjour / avahi / etc.
+            // which already bind 5353 exclusively for unicast).
+            if (senders == null) return;
+            foreach (var sender in senders)
             {
-                try { client.Send(datagram, datagram.Length, ep); }
+                try { sender.Send(datagram, datagram.Length, ep); }
                 catch (SocketException) { /* interface may have gone away */ }
             }
         }
@@ -105,6 +112,50 @@ internal sealed class MulticastTransport : IDisposable
     // -------------------------------------------------------------------------
     // Socket setup
     // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Build one UDP socket per interface, bound to an ephemeral port. These
+    /// sockets are used to SEND queries. Because they bind to a random port,
+    /// unicast replies (to the querier's source address/port) come back to
+    /// us rather than being absorbed by Bonjour / avahi / Windows mDNS also
+    /// bound to 5353.
+    /// </summary>
+    private static UdpClient[] BuildSenderClients()
+    {
+        var result = new List<UdpClient>();
+
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (!nic.SupportsMulticast) continue;
+            if (nic.OperationalStatus != OperationalStatus.Up) continue;
+            if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+
+            var ipProps = nic.GetIPProperties();
+            IPv4InterfaceProperties? ipv4Props;
+            try { ipv4Props = ipProps.GetIPv4Properties(); }
+            catch (NetworkInformationException) { continue; }
+            if (ipv4Props == null) continue;
+
+            if (!ipProps.UnicastAddresses.Any(u => u.Address.AddressFamily == AddressFamily.InterNetwork))
+                continue;
+
+            try
+            {
+                // Ephemeral port on this interface. MulticastInterface ensures
+                // outbound multicast packets go out this specific adapter.
+                var client = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
+                client.Client.SetSocketOption(SocketOptionLevel.IP,
+                    SocketOptionName.MulticastInterface,
+                    IPAddress.HostToNetworkOrder(ipv4Props.Index));
+                client.Client.SetSocketOption(SocketOptionLevel.IP,
+                    SocketOptionName.MulticastTimeToLive, 255);
+                result.Add(client);
+            }
+            catch (SocketException) { /* skip interface */ }
+        }
+
+        return result.ToArray();
+    }
 
     private static UdpClient[] BuildClients()
     {
@@ -216,6 +267,11 @@ internal sealed class MulticastTransport : IDisposable
             {
                 foreach (var c in clients) c.Dispose();
                 clients = null;
+            }
+            if (senders != null)
+            {
+                foreach (var s in senders) s.Dispose();
+                senders = null;
             }
         }
     }
