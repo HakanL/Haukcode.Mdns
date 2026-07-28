@@ -127,6 +127,12 @@ public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
 
         bool changed = false;
 
+        // A multi-homed responder sends one A record per address, most preferred
+        // first. Taking each in turn would leave us holding the last one — the
+        // least preferred — so only the first address per hostname in a given
+        // message is used. A later message can still change the address.
+        var addressTakenFor = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         lock (mutex)
         {
             foreach (var record in allRecords)
@@ -177,6 +183,9 @@ public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
                         // Match by hostname against known services
                         var ip = DnsParser.ParseA(record.Data);
                         if (ip == null) break;
+
+                        if (!addressTakenFor.Add(record.Name))
+                            break;
 
                         foreach (var svc in services.Values)
                         {

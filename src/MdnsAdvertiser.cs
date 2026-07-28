@@ -20,7 +20,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
 
     private readonly MulticastTransport transport;
     private readonly ServiceProfile profile;
-    private readonly IPAddress localAddress;
+    private readonly IReadOnlyList<IPAddress> localAddresses;
 
     private readonly Timer announceTimer;
     private AnnounceState state = AnnounceState.Idle;
@@ -44,14 +44,20 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
 
     /// <param name="profile">Service to advertise.</param>
     /// <param name="localAddress">
-    /// Local IPv4 address to include in A records.
-    /// If null, <see cref="MulticastTransport.GetLocalAddress"/> is used.
+    /// Local IPv4 address to include in A records. When null, every local address is
+    /// advertised (see <see cref="MulticastTransport.GetLocalAddresses"/>) so that a
+    /// multi-homed host is reachable from all of its networks; pass an address
+    /// explicitly to advertise on one network only.
     /// </param>
     public MdnsAdvertiser(ServiceProfile profile, IPAddress? localAddress = null)
     {
-        this.profile      = profile;
-        this.localAddress = localAddress ?? MulticastTransport.GetLocalAddress()
-            ?? throw new InvalidOperationException("No suitable local IPv4 address found.");
+        this.profile = profile;
+        this.localAddresses = localAddress != null
+            ? [localAddress]
+            : [.. MulticastTransport.GetLocalAddresses()];
+
+        if (this.localAddresses.Count == 0)
+            throw new InvalidOperationException("No suitable local IPv4 address found.");
 
         transport = new MulticastTransport();
         transport.PacketReceived += OnPacketReceived;
@@ -203,8 +209,11 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
 
         msg.Authorities.Add(new DnsRecord(profile.FullInstanceName, DnsRecordType.SRV, DnsClass.IN, ShortTtl,
             DnsEncoder.BuildSrv(0, 0, profile.Port, profile.Hostname)));
-        msg.Authorities.Add(new DnsRecord(profile.Hostname, DnsRecordType.A, DnsClass.IN, ShortTtl,
-            DnsEncoder.BuildA(localAddress)));
+        foreach (var address in localAddresses)
+        {
+            msg.Authorities.Add(new DnsRecord(profile.Hostname, DnsRecordType.A, DnsClass.IN, ShortTtl,
+                DnsEncoder.BuildA(address)));
+        }
 
         return msg;
     }
@@ -229,9 +238,13 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
         msg.Answers.Add(new DnsRecord(profile.FullServiceType, DnsRecordType.PTR, DnsClass.IN, LongTtl,
             DnsEncoder.BuildPtr(profile.FullInstanceName)));
 
-        // A
-        msg.Answers.Add(new DnsRecord(profile.Hostname, DnsRecordType.A, DnsClass.IN_Unicast, ShortTtl,
-            DnsEncoder.BuildA(localAddress)));
+        // A — one per local address, so a client on any of our networks has a
+        // reachable answer rather than only the first interface's address.
+        foreach (var address in localAddresses)
+        {
+            msg.Answers.Add(new DnsRecord(profile.Hostname, DnsRecordType.A, DnsClass.IN_Unicast, ShortTtl,
+                DnsEncoder.BuildA(address)));
+        }
 
         return msg;
     }

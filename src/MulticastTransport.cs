@@ -76,27 +76,72 @@ internal sealed class MulticastTransport : IDisposable
             var ethernet = new List<IPAddress>();
             var wifi     = new List<IPAddress>();
 
-            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
-            {
-                if (!nic.SupportsMulticast) continue;
-                if (nic.OperationalStatus != OperationalStatus.Up) continue;
-                if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
-
-                foreach (var ua in nic.GetIPProperties().UnicastAddresses)
-                {
-                    var ip = ua.Address;
-                    if (ip.AddressFamily != AddressFamily.InterNetwork) continue;
-                    if (IPAddress.IsLoopback(ip)) continue;
-
-                    if (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211)
-                        wifi.Add(ip);
-                    else
-                        ethernet.Add(ip);
-                }
-            }
+            CollectAddresses(ethernet, wifi);
 
             return PickSticky(ethernet, ref stickyEthernet)
                 ?? PickSticky(wifi, ref stickyWifi);
+        }
+    }
+
+    private static void CollectAddresses(List<IPAddress> ethernet, List<IPAddress> wifi)
+    {
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (!nic.SupportsMulticast) continue;
+            if (nic.OperationalStatus != OperationalStatus.Up) continue;
+            if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+
+            foreach (var ua in nic.GetIPProperties().UnicastAddresses)
+            {
+                var ip = ua.Address;
+                if (ip.AddressFamily != AddressFamily.InterNetwork) continue;
+                if (IPAddress.IsLoopback(ip)) continue;
+
+                if (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211)
+                    wifi.Add(ip);
+                else
+                    ethernet.Add(ip);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Every local IPv4 address worth advertising, wired first then wireless.
+    /// </summary>
+    /// <remarks>
+    /// A multi-homed host reachable on several networks should say so: advertising a
+    /// single address means clients on the other networks are handed one they may not
+    /// be able to reach, and there is nothing in the response for them to fall back to.
+    /// Publishing an A record per address is what avahi and Bonjour do, and the client
+    /// picks whichever answers. Ordering still puts wired first, so a client that
+    /// simply takes the first one keeps the old behaviour.
+    /// </remarks>
+    public static IReadOnlyList<IPAddress> GetLocalAddresses()
+    {
+        lock (ipLock)
+        {
+            var ethernet = new List<IPAddress>();
+            var wifi     = new List<IPAddress>();
+
+            CollectAddresses(ethernet, wifi);
+
+            // Keep the sticky choice at the head of the list so the address a client
+            // sees first stays put across calls, rather than reordering underneath it.
+            var preferred = PickSticky(ethernet, ref stickyEthernet)
+                ?? PickSticky(wifi, ref stickyWifi);
+
+            var result = new List<IPAddress>();
+
+            if (preferred != null)
+                result.Add(preferred);
+
+            foreach (var ip in ethernet.Concat(wifi))
+            {
+                if (!result.Contains(ip))
+                    result.Add(ip);
+            }
+
+            return result;
         }
     }
 
