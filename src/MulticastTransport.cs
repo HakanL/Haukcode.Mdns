@@ -101,6 +101,7 @@ internal sealed class MulticastTransport : IDisposable
             if (!nic.SupportsMulticast) continue;
             if (nic.OperationalStatus != OperationalStatus.Up) continue;
             if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+            if (IsPointToPoint(nic)) continue;
 
             bool isVirtual = IsLikelyVirtual(nic);
             bool isWifi = nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211;
@@ -124,6 +125,44 @@ internal sealed class MulticastTransport : IDisposable
         ethernet.AddRange(virtualEthernet);
         wifi.AddRange(physicalWifi);
         wifi.AddRange(virtualWifi);
+    }
+
+    /// <summary>
+    /// A point-to-point link (VPN tunnel, PPP) — excluded outright, unlike the
+    /// virtual adapters below which are merely sorted last.
+    /// </summary>
+    /// <remarks>
+    /// This is a categorical exclusion rather than a guess. mDNS is link-local: a
+    /// responder answers on links it shares with the querier, and a point-to-point
+    /// tunnel has exactly one peer and no multicast neighbours to answer. Advertising
+    /// such an address (e.g. a 100.64.0.0/10 CGNAT address on a VPN tun device) hands
+    /// every listener on the real network an address none of them can use. A Hyper-V
+    /// or Docker bridge is a different case — a real broadcast link with real peers —
+    /// so those are only deprioritised.
+    /// </remarks>
+    internal static bool IsPointToPoint(NetworkInterface nic)
+    {
+        if (nic.NetworkInterfaceType is NetworkInterfaceType.Tunnel or NetworkInterfaceType.Ppp)
+            return true;
+
+        // On Linux the link-layer type is authoritative and cheap: ARPHRD_ETHER (1)
+        // covers ethernet and Wi-Fi, while a tun device reports ARPHRD_NONE (65534).
+        if (OperatingSystem.IsLinux())
+        {
+            try
+            {
+                string path = $"/sys/class/net/{nic.Name}/type";
+
+                if (File.Exists(path) && int.TryParse(File.ReadAllText(path).Trim(), out int arpHrdType))
+                    return arpHrdType != 1;
+            }
+            catch
+            {
+                // Fall through — treat as a normal link
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
