@@ -386,37 +386,68 @@ internal sealed class MulticastTransport : IDisposable
 
     private void BeginReceive(UdpClient client)
     {
-        client.BeginReceive(ReceiveCallback, client);
+        _ = ReceiveLoopAsync(client);
     }
 
-    private void ReceiveCallback(IAsyncResult result)
+    /// <summary>
+    /// Persistent receive loop for one socket. Replaces the earlier
+    /// BeginReceive/EndReceive chain, which a single unexpected exception could
+    /// sever silently: an escape from the callback became an unobserved task
+    /// exception, the socket was never re-armed, and from then on queries piled
+    /// up unread in a full kernel buffer while the process looked healthy.
+    /// Observed in production as "device advertises at startup, goes deaf
+    /// minutes later" — /proc/net/udp showed the 5353 receive queues full with
+    /// thousands of drops. A loop has no re-arm step to miss: every failure
+    /// path either exits because we are disposed or iterates and receives
+    /// again.
+    /// </summary>
+    private async Task ReceiveLoopAsync(UdpClient client)
     {
-        var client = (UdpClient)result.AsyncState!;
-
-        byte[]? data = null;
-        IPEndPoint? remote = null;
-
-        lock (mutex)
+        while (true)
         {
-            if (disposed) return;
+            byte[] data;
+            IPEndPoint remote;
 
             try
             {
-                IPEndPoint? ep = new(IPAddress.Any, 0);
-                data = client.EndReceive(result, ref ep);
-                remote = ep;
+                var result = await client.ReceiveAsync().ConfigureAwait(false);
+                data = result.Buffer;
+                remote = result.RemoteEndPoint;
             }
-            catch (SocketException) { /* socket closed */ }
-            catch (ObjectDisposedException) { return; }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+            catch (Exception)
+            {
+                lock (mutex)
+                {
+                    if (disposed) return;
+                }
 
-            // Re-arm before invoking the event so we never miss a packet
-            try { client.BeginReceive(ReceiveCallback, client); }
-            catch (ObjectDisposedException) { }
+                // Transient by assumption (an ICMP error surfaced on the socket,
+                // an interface blip, ...). The brief pause keeps a persistent
+                // error from becoming a hot spin; the loop stays alive either
+                // way, because a dead receive loop is strictly worse than a
+                // noisy one.
+                await Task.Delay(250).ConfigureAwait(false);
+                continue;
+            }
+
+            lock (mutex)
+            {
+                if (disposed) return;
+            }
+
+            try
+            {
+                PacketReceived?.Invoke(data, remote);
+            }
+            catch
+            {
+                // A subscriber bug must not take the receive loop down with it.
+            }
         }
-
-        // Invoke outside the lock to prevent lock-order deadlocks with subscribers
-        if (data != null && remote != null)
-            PacketReceived?.Invoke(data, remote);
     }
 
     // -------------------------------------------------------------------------
