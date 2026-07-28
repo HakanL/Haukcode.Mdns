@@ -24,10 +24,23 @@ public sealed class ServiceProfile
     public IReadOnlyDictionary<string, string> Properties { get; }
 
     /// <summary>
-    /// Resolved IPv4 address. Populated when a service is discovered via browsing;
-    /// null when used to describe a local service to advertise.
+    /// Resolved IPv4 address — the first of <see cref="Addresses"/>. Populated when a
+    /// service is discovered via browsing; null when used to describe a local service
+    /// to advertise.
     /// </summary>
+    /// <remarks>
+    /// A multi-homed responder publishes several addresses and only the caller knows
+    /// which of them it can actually reach — prefer <see cref="Addresses"/> and pick
+    /// one on your own subnet. This property is the first advertised address, which is
+    /// not necessarily a reachable one.
+    /// </remarks>
     public IPAddress? Address { get; internal set; }
+
+    /// <summary>
+    /// Every IPv4 address the service advertised, in the order it announced them.
+    /// Empty for a profile describing a local service to advertise.
+    /// </summary>
+    public IReadOnlyList<IPAddress> Addresses { get; internal set; } = [];
 
     /// <summary>
     /// Fully-qualified service type: "_apple-midi._udp.local."

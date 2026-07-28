@@ -127,10 +127,10 @@ public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
 
         bool changed = false;
 
-        // A multi-homed responder sends one A record per address, most preferred
-        // first. Taking each in turn would leave us holding the last one — the
-        // least preferred — so only the first address per hostname in a given
-        // message is used. A later message can still change the address.
+        // A multi-homed responder sends one A record per address in a single message.
+        // Tracks which hostnames have already had their address set replaced by this
+        // message, so the first record clears the previous set and the rest append to
+        // it rather than each one overwriting the last.
         var addressTakenFor = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         lock (mutex)
@@ -184,23 +184,31 @@ public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
                         var ip = DnsParser.ParseA(record.Data);
                         if (ip == null) break;
 
-                        if (!addressTakenFor.Add(record.Name))
-                            break;
-
                         foreach (var svc in services.Values)
                         {
                             if (string.Equals(svc.Hostname, record.Name, StringComparison.OrdinalIgnoreCase) ||
                                 string.Equals(svc.Hostname, record.Name + ".", StringComparison.OrdinalIgnoreCase))
                             {
-                                svc.Address = ip;
-                                changed = true;
+                                // The first A record for this name in this message starts
+                                // a fresh set: a responder announces its current addresses
+                                // together, so anything we held before is stale. Later
+                                // records in the same message add to it, preserving the
+                                // announced order.
+                                if (addressTakenFor.Add(record.Name))
+                                    svc.Addresses.Clear();
+
+                                if (!svc.Addresses.Contains(ip))
+                                {
+                                    svc.Addresses.Add(ip);
+                                    changed = true;
+                                }
                             }
                         }
 
                         // Also try matching by remote endpoint as fallback
                         foreach (var svc in services.Values.Where(s => s.Address == null))
                         {
-                            svc.Address = remote.Address;
+                            svc.Addresses.Add(remote.Address);
                             changed = true;
                         }
                         break;
@@ -331,7 +339,8 @@ public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
         public string ServiceType  { get; } = serviceType;
         public ushort Port     { get; set; }
         public string? Hostname { get; set; }
-        public IPAddress? Address { get; set; }
+        public List<IPAddress> Addresses { get; } = [];
+        public IPAddress? Address => Addresses.Count > 0 ? Addresses[0] : null;
         public Dictionary<string, string> Properties { get; set; } = [];
         public uint PtrTtl    { get; set; }
         public DateTime PtrExpiry { get; set; }
@@ -348,6 +357,7 @@ public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
             Properties)
         {
             Address = Address,
+            Addresses = Addresses.ToArray(),
         };
     }
 }

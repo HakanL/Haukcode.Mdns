@@ -75,21 +75,35 @@ internal sealed class MulticastTransport : IDisposable
         {
             var ethernet = new List<IPAddress>();
             var wifi     = new List<IPAddress>();
+            var virtualAddresses = new HashSet<IPAddress>();
 
-            CollectAddresses(ethernet, wifi);
+            CollectAddresses(ethernet, wifi, virtualAddresses);
 
-            return PickSticky(ethernet, ref stickyEthernet)
-                ?? PickSticky(wifi, ref stickyWifi);
+            return PickSticky(ethernet, virtualAddresses, ref stickyEthernet)
+                ?? PickSticky(wifi, virtualAddresses, ref stickyWifi);
         }
     }
 
-    private static void CollectAddresses(List<IPAddress> ethernet, List<IPAddress> wifi)
+    private static void CollectAddresses(List<IPAddress> ethernet, List<IPAddress> wifi, HashSet<IPAddress>? virtualAddresses = null)
     {
+        // Physical adapters are collected ahead of virtual ones so that the address a
+        // caller reaches for first is the one most likely to be reachable from another
+        // machine. A Hyper-V/WSL/Docker switch address is perfectly valid locally and
+        // completely useless to anyone else, and on a developer machine those often
+        // enumerate first.
+        var physicalEthernet = new List<IPAddress>();
+        var virtualEthernet  = new List<IPAddress>();
+        var physicalWifi     = new List<IPAddress>();
+        var virtualWifi      = new List<IPAddress>();
+
         foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
         {
             if (!nic.SupportsMulticast) continue;
             if (nic.OperationalStatus != OperationalStatus.Up) continue;
             if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+
+            bool isVirtual = IsLikelyVirtual(nic);
+            bool isWifi = nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211;
 
             foreach (var ua in nic.GetIPProperties().UnicastAddresses)
             {
@@ -97,12 +111,67 @@ internal sealed class MulticastTransport : IDisposable
                 if (ip.AddressFamily != AddressFamily.InterNetwork) continue;
                 if (IPAddress.IsLoopback(ip)) continue;
 
-                if (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211)
-                    wifi.Add(ip);
-                else
-                    ethernet.Add(ip);
+                if (isVirtual)
+                    virtualAddresses?.Add(ip);
+
+                (isWifi
+                    ? (isVirtual ? virtualWifi : physicalWifi)
+                    : (isVirtual ? virtualEthernet : physicalEthernet)).Add(ip);
             }
         }
+
+        ethernet.AddRange(physicalEthernet);
+        ethernet.AddRange(virtualEthernet);
+        wifi.AddRange(physicalWifi);
+        wifi.AddRange(virtualWifi);
+    }
+
+    /// <summary>
+    /// Best-effort "this adapter is a virtual switch, not a way off this machine".
+    /// Only ever used to sort addresses, never to drop one — a wrong guess costs
+    /// ordering, not reachability.
+    /// </summary>
+    internal static bool IsLikelyVirtual(NetworkInterface nic)
+    {
+        // Linux puts virtual devices (bridges, veth, tun, docker) under
+        // /sys/devices/virtual/net; a real NIC resolves to a pci/platform/usb path.
+        if (OperatingSystem.IsLinux())
+        {
+            try
+            {
+                var target = Directory.ResolveLinkTarget($"/sys/class/net/{nic.Name}", returnFinalTarget: true);
+
+                if (target != null)
+                    return target.FullName.Contains("/devices/virtual/", StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                // Fall through to the vendor checks below
+            }
+        }
+
+        // Well-known virtual-NIC MAC prefixes.
+        var mac = nic.GetPhysicalAddress().GetAddressBytes();
+        if (mac.Length == 6)
+        {
+            // Hyper-V, VMware (three ranges), VirtualBox, Docker/veth
+            if (mac[0] == 0x00 && mac[1] == 0x15 && mac[2] == 0x5D) return true;
+            if (mac[0] == 0x00 && mac[1] == 0x50 && mac[2] == 0x56) return true;
+            if (mac[0] == 0x00 && mac[1] == 0x0C && mac[2] == 0x29) return true;
+            if (mac[0] == 0x00 && mac[1] == 0x05 && mac[2] == 0x69) return true;
+            if (mac[0] == 0x08 && mac[1] == 0x00 && mac[2] == 0x27) return true;
+            if (mac[0] == 0x02 && mac[1] == 0x42) return true;
+        }
+
+        // Last resort: what the OS calls it. Windows names its switches plainly.
+        var text = $"{nic.Name} {nic.Description}";
+
+        return text.Contains("Hyper-V", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Virtual", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("VMware", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("VirtualBox", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("WSL", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Default Switch", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -122,13 +191,14 @@ internal sealed class MulticastTransport : IDisposable
         {
             var ethernet = new List<IPAddress>();
             var wifi     = new List<IPAddress>();
+            var virtualAddresses = new HashSet<IPAddress>();
 
-            CollectAddresses(ethernet, wifi);
+            CollectAddresses(ethernet, wifi, virtualAddresses);
 
             // Keep the sticky choice at the head of the list so the address a client
             // sees first stays put across calls, rather than reordering underneath it.
-            var preferred = PickSticky(ethernet, ref stickyEthernet)
-                ?? PickSticky(wifi, ref stickyWifi);
+            var preferred = PickSticky(ethernet, virtualAddresses, ref stickyEthernet)
+                ?? PickSticky(wifi, virtualAddresses, ref stickyWifi);
 
             var result = new List<IPAddress>();
 
@@ -145,12 +215,25 @@ internal sealed class MulticastTransport : IDisposable
         }
     }
 
-    private static IPAddress? PickSticky(List<IPAddress> list, ref IPAddress? sticky)
+    private static IPAddress? PickSticky(List<IPAddress> list, HashSet<IPAddress> virtualAddresses, ref IPAddress? sticky)
     {
         if (list.Count == 0) return null;
+
         var current = sticky;
-        if (current != null && list.Any(ip => ip.Equals(current))) return current;
+
+        if (current != null && list.Any(ip => ip.Equals(current)))
+        {
+            // Keep the previous choice, unless it is a virtual adapter and a physical
+            // one is now available — otherwise a machine that came up with only its
+            // Hyper-V switch ready would stay pinned to it for the life of the process.
+            bool stuckOnVirtual = virtualAddresses.Contains(current) && !virtualAddresses.Contains(list[0]);
+
+            if (!stuckOnVirtual)
+                return current;
+        }
+
         sticky = list[0];
+
         return sticky;
     }
 

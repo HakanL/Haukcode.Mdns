@@ -84,6 +84,46 @@ public class MultiHomedTests
         Assert.Equal(Wired, chosen);
     }
 
+    /// <summary>
+    /// Physical adapters must all come before virtual ones, so a consumer that takes
+    /// only the first address gets the one most likely to be reachable from another
+    /// machine. Asserted as a partition rather than against fixed addresses, so it
+    /// holds on any machine — including one with no virtual adapters at all.
+    /// </summary>
+    [Fact]
+    public void GetLocalAddresses_PhysicalBeforeVirtual()
+    {
+        var virtualAddresses = new HashSet<IPAddress>();
+
+        foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (!MulticastTransport.IsLikelyVirtual(nic))
+                continue;
+
+            foreach (var ua in nic.GetIPProperties().UnicastAddresses)
+            {
+                if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                    virtualAddresses.Add(ua.Address);
+            }
+        }
+
+        var all = MulticastTransport.GetLocalAddresses();
+
+        bool seenVirtual = false;
+
+        foreach (var ip in all)
+        {
+            if (virtualAddresses.Contains(ip))
+            {
+                seenVirtual = true;
+
+                continue;
+            }
+
+            Assert.False(seenVirtual, $"physical address {ip} came after a virtual one");
+        }
+    }
+
     [Fact]
     public void ExplicitAddress_AdvertisesOnlyThatOne()
     {
