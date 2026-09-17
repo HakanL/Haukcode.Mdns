@@ -90,6 +90,36 @@ public class LegacyUnicastTests
     // The receive-side half of the same rule
     // -------------------------------------------------------------------------
 
+    // -------------------------------------------------------------------------
+    // Announcement record order
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void Announcement_PutsTheServiceTypePtrBeforeEverythingElse()
+    {
+        // lwIP-based clients (ESP-IDF, Zephyr, the RP2350 firmware) match a browse
+        // response to their outstanding request at the PTR naming the service type,
+        // and discard every record that preceded it in the packet. With SRV first,
+        // those clients resolve the address but report port 0. This is not cosmetic
+        // ordering — do not "tidy" it.
+        var profile = new ServiceProfile("Test Core", "_osc._udp", 9000);
+        using var advertiser = new MdnsAdvertiser(profile, Local);
+
+        Assert.True(DnsParser.TryParse(DnsEncoder.Encode(advertiser.BuildAnnounceMessage()), out var parsed));
+        Assert.NotNull(parsed);
+
+        var first = parsed!.Answers[0];
+        Assert.Equal(DnsRecordType.PTR, first.Type);
+        Assert.Equal(ServiceType, first.Name, ignoreCase: true);
+
+        // Everything a client needs to reach the service must come after that PTR.
+        foreach (var type in new[] { DnsRecordType.SRV, DnsRecordType.TXT, DnsRecordType.A })
+        {
+            int index = parsed.Answers.FindIndex(x => x.Type == type);
+            Assert.True(index > 0, $"{type} record is missing from the announcement");
+        }
+    }
+
     [Fact]
     public void Browser_IgnoresResponsesFromAnyOtherPort_ByDefault()
     {

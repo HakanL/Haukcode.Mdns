@@ -244,9 +244,35 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
         return msg;
     }
 
-    private DnsMessage BuildAnnounceMessage()
+    /// <summary>
+    /// The full announcement: PTR, SRV, TXT and one A per local address.
+    /// </summary>
+    /// <remarks>
+    /// Record order is load-bearing, which is not obvious from the wire format. A
+    /// browsing client matches an incoming packet to its outstanding request by the
+    /// PTR answer naming the service type; lwIP (and the stacks built on it — ESP-IDF,
+    /// Zephyr) establishes the request at that record and drops everything that came
+    /// *before* it in the packet. With SRV first, as this built the message until now,
+    /// every such client learned the name and address but got port 0 and had to guess.
+    /// So the service-type PTR goes first and everything that describes the instance
+    /// follows it.
+    ///
+    /// Everything stays in the Answer section rather than moving SRV/TXT/A to
+    /// Additional, which is the other way to fix the same thing: these messages are
+    /// also the unsolicited announcements, and RFC 6762 §8.3 asks for the newly
+    /// registered records in the Answer section. Ordering satisfies both readings.
+    /// </remarks>
+    internal DnsMessage BuildAnnounceMessage()
     {
         var msg = new DnsMessage { IsResponse = true, IsAuthoritative = true };
+
+        // PTR: service type → instance. First, deliberately — see above.
+        msg.Answers.Add(new DnsRecord(profile.FullServiceType, DnsRecordType.PTR, DnsClass.IN, LongTtl,
+            DnsEncoder.BuildPtr(profile.FullInstanceName)));
+
+        // PTR: _services._dns-sd._udp.local. → service type
+        msg.Answers.Add(new DnsRecord("_services._dns-sd._udp.local.", DnsRecordType.PTR, DnsClass.IN, LongTtl,
+            DnsEncoder.BuildPtr(profile.FullServiceType)));
 
         // SRV
         msg.Answers.Add(new DnsRecord(profile.FullInstanceName, DnsRecordType.SRV, DnsClass.IN_Unicast, ShortTtl,
@@ -255,14 +281,6 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
         // TXT
         msg.Answers.Add(new DnsRecord(profile.FullInstanceName, DnsRecordType.TXT, DnsClass.IN_Unicast, LongTtl,
             DnsEncoder.BuildTxt(profile.Properties)));
-
-        // PTR: _services._dns-sd._udp.local. → service type
-        msg.Answers.Add(new DnsRecord("_services._dns-sd._udp.local.", DnsRecordType.PTR, DnsClass.IN, LongTtl,
-            DnsEncoder.BuildPtr(profile.FullServiceType)));
-
-        // PTR: service type → instance
-        msg.Answers.Add(new DnsRecord(profile.FullServiceType, DnsRecordType.PTR, DnsClass.IN, LongTtl,
-            DnsEncoder.BuildPtr(profile.FullInstanceName)));
 
         // A — one per local address, so a client on any of our networks has a
         // reachable answer rather than only the first interface's address.
