@@ -13,7 +13,10 @@ namespace Haukcode.Mdns;
 /// </summary>
 public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
 {
+    private const int MdnsPort = 5353;
+
     private readonly string serviceType; // e.g. "_apple-midi._udp.local."
+    private readonly bool acceptResponsesFromAnyPort;
     private readonly MulticastTransport transport;
     private readonly Timer expiryTimer;
     private readonly object mutex = new();
@@ -43,11 +46,26 @@ public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
     /// Service type to browse, e.g. "_apple-midi._udp" or "_osc._udp".
     /// Do not include ".local." — it is appended automatically.
     /// </param>
-    public MdnsBrowser(string serviceType)
+    /// <param name="acceptResponsesFromAnyPort">
+    /// Accept responses whose source UDP port is not 5353, which RFC 6762 §6 says to
+    /// silently ignore. Off by default — leave it off unless you have a specific reason.
+    /// </param>
+    /// <remarks>
+    /// The escape hatch exists for exactly one situation: a network that still holds
+    /// responders which send from an ephemeral port, as this library itself did up to
+    /// 1.0.18. Enforcing the rule makes those responders invisible, so a rollout where
+    /// browser and responder upgrade at different times needs a way to stay lenient
+    /// until the last old responder is gone. It is a transitional setting, not a
+    /// preference: anything that reaches you only because of it is, by the letter of
+    /// the spec, not Multicast DNS.
+    /// </remarks>
+    public MdnsBrowser(string serviceType, bool acceptResponsesFromAnyPort = false)
     {
         this.serviceType = serviceType.EndsWith(".local.", StringComparison.OrdinalIgnoreCase)
             ? serviceType
             : serviceType + ".local.";
+
+        this.acceptResponsesFromAnyPort = acceptResponsesFromAnyPort;
 
         transport = new MulticastTransport();
         transport.PacketReceived += OnPacketReceived;
@@ -118,9 +136,27 @@ public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
     // Receive
     // -------------------------------------------------------------------------
 
+    /// <summary>
+    /// RFC 6762 §6: "Multicast DNS implementations MUST silently ignore any Multicast
+    /// DNS responses they receive where the source UDP port is not 5353."
+    /// </summary>
+    /// <remarks>
+    /// The rule is not pedantry. A response from an ephemeral port is either a reply to
+    /// a legacy one-shot query somebody else asked — whose TTLs are capped at 10 s and
+    /// whose records are therefore wrong to cache as though they were announcements —
+    /// or it is unsolicited traffic from something that is not a responder at all.
+    /// Honoring either one puts entries in the cache that no goodbye packet will ever
+    /// clear.
+    /// </remarks>
+    internal bool ShouldIgnoreResponseFrom(int sourcePort)
+        => !acceptResponsesFromAnyPort && sourcePort != MdnsPort;
+
     private void OnPacketReceived(byte[] data, IPEndPoint remote)
     {
         if (!DnsParser.TryParse(data, out var msg) || msg == null || !msg.IsResponse)
+            return;
+
+        if (ShouldIgnoreResponseFrom(remote.Port))
             return;
 
         var allRecords = msg.Answers.Concat(msg.Authorities).Concat(msg.Additionals).ToList();

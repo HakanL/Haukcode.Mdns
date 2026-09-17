@@ -7,7 +7,8 @@ namespace Haukcode.Mdns;
 ///   1. Probe: send claim packet with SRV+A in the Authority section
 ///   2. Announce x3: send full response with PTR+SRV+TXT+A
 ///   3. Steady state: re-announce at 50%, 90%, 95% of TTL
-///   4. Respond to incoming PTR queries for the service type
+///   4. Respond to incoming PTR queries for the service type — multicast to a
+///      compliant querier, unicast to a legacy one-shot resolver (§6.7)
 ///   5. Goodbye: re-send with TTL=0 on dispose (x2, 500 ms apart)
 ///
 /// Note: Full name-conflict resolution (RFC 6762 §8) is not implemented.
@@ -17,6 +18,15 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
 {
     private const uint LongTtl  = 4500;
     private const uint ShortTtl = 120;
+
+    /// <summary>
+    /// Ceiling on every TTL in a legacy unicast response (RFC 6762 §6.7). A legacy
+    /// resolver has no way to learn that a record went away — it never sees our
+    /// goodbye packets — so it must be handed something that expires on its own.
+    /// </summary>
+    private const uint LegacyTtl = 10;
+
+    private const int MdnsPort = 5353;
 
     private readonly MulticastTransport transport;
     private readonly ServiceProfile profile;
@@ -96,7 +106,14 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
     {
         lock (mutex)
         {
-            if (disposed) return;
+            // The goodbye states run *because* we are disposed — BeginGoodbye sets the
+            // flag before handing the rest of the sequence to this timer. Bailing out
+            // on the flag alone (as this did) meant the second goodbye packet was never
+            // sent, goodbyeDone was never completed, and every teardown paid the full
+            // wait: 2 s of dead time from Dispose, and a TimeoutException out of
+            // DisposeAsync.
+            if (disposed && state != AnnounceState.Goodbye1)
+                return;
 
             switch (state)
             {
@@ -147,15 +164,10 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
                 case AnnounceState.Goodbye1:
                     if (--countdown == 0)
                     {
+                        // Second and last goodbye, 500 ms after the one BeginGoodbye
+                        // sent inline. Nothing is waiting after it, so release the
+                        // caller here rather than idling through another state.
                         transport.Send(DnsEncoder.Encode(BuildGoodbyeMessage()));
-                        state = AnnounceState.Goodbye2;
-                        countdown = 2;
-                    }
-                    break;
-
-                case AnnounceState.Goodbye2:
-                    if (--countdown == 0)
-                    {
                         state = AnnounceState.Idle;
                         goodbyeDone.TrySetResult(true);
                         return; // done — no reschedule
@@ -179,6 +191,13 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
         if (!DnsParser.TryParse(data, out var msg) || msg == null || msg.IsResponse)
             return;
 
+        // A query from a port other than 5353 is a one-shot resolver — `dns-sd`,
+        // a browser's discovery call, an embedded client — not a full Multicast
+        // DNS querier (RFC 6762 §5.1). It is listening on that ephemeral socket
+        // for a unicast answer and generally not a member of the multicast group
+        // at all, so a multicast re-announce never reaches it.
+        bool isLegacyQuerier = remote.Port != MdnsPort;
+
         lock (mutex)
         {
             if (state != AnnounceState.Ready) return;
@@ -188,9 +207,16 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
                 if (q.Type == DnsRecordType.PTR &&
                     string.Equals(q.Name, profile.FullServiceType, StringComparison.OrdinalIgnoreCase))
                 {
-                    // Re-announce immediately
-                    transport.Send(DnsEncoder.Encode(BuildAnnounceMessage()));
-                    elapsed.Restart();
+                    if (isLegacyQuerier)
+                    {
+                        transport.SendTo(DnsEncoder.Encode(BuildLegacyResponse(q, msg.Id)), remote);
+                    }
+                    else
+                    {
+                        // Re-announce immediately
+                        transport.Send(DnsEncoder.Encode(BuildAnnounceMessage()));
+                        elapsed.Restart();
+                    }
                     break;
                 }
             }
@@ -249,6 +275,49 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
         return msg;
     }
 
+    /// <summary>
+    /// Build the unicast answer to a legacy one-shot query (RFC 6762 §6.7).
+    /// </summary>
+    /// <remarks>
+    /// This is not the announce message with a different destination — a legacy
+    /// resolver parses it as ordinary DNS, so four things differ:
+    ///
+    ///   * the query's ID is echoed (our multicast messages always use ID 0, which a
+    ///     legacy resolver would reject as not matching its outstanding query);
+    ///   * the question is repeated in the Question section, as a DNS reply must;
+    ///   * the cache-flush bit is never set — in ordinary DNS that bit is part of the
+    ///     class, so IN_Unicast (0x8001) reads as class 32769 and the record is
+    ///     discarded as unknown;
+    ///   * every TTL is capped at <see cref="LegacyTtl"/> seconds.
+    ///
+    /// The answer to the PTR question goes in the Answer section and everything needed
+    /// to actually reach the service rides along in Additionals, so a one-shot browse
+    /// resolves in a single round trip.
+    /// </remarks>
+    internal DnsMessage BuildLegacyResponse(DnsQuestion question, ushort queryId)
+    {
+        var msg = new DnsMessage { Id = queryId, IsResponse = true, IsAuthoritative = true };
+
+        msg.Questions.Add(question);
+
+        msg.Answers.Add(new DnsRecord(profile.FullServiceType, DnsRecordType.PTR, DnsClass.IN, LegacyTtl,
+            DnsEncoder.BuildPtr(profile.FullInstanceName)));
+
+        msg.Additionals.Add(new DnsRecord(profile.FullInstanceName, DnsRecordType.SRV, DnsClass.IN, LegacyTtl,
+            DnsEncoder.BuildSrv(0, 0, profile.Port, profile.Hostname)));
+
+        msg.Additionals.Add(new DnsRecord(profile.FullInstanceName, DnsRecordType.TXT, DnsClass.IN, LegacyTtl,
+            DnsEncoder.BuildTxt(profile.Properties)));
+
+        foreach (var address in localAddresses)
+        {
+            msg.Additionals.Add(new DnsRecord(profile.Hostname, DnsRecordType.A, DnsClass.IN, LegacyTtl,
+                DnsEncoder.BuildA(address)));
+        }
+
+        return msg;
+    }
+
     private DnsMessage BuildGoodbyeMessage()
     {
         var msg = new DnsMessage { IsResponse = true, IsAuthoritative = true };
@@ -272,8 +341,17 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         BeginGoodbye();
-        // Task.WaitAsync avoids blocking a thread pool thread (available since .NET 6)
-        await goodbyeDone.Task.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        // Task.WaitAsync avoids blocking a thread pool thread (available since .NET 6).
+        // A goodbye that cannot complete must not abort teardown — throwing here would
+        // leave the sockets open, which is the one outcome Dispose exists to prevent.
+        try
+        {
+            await goodbyeDone.Task.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+        }
+
         ReleaseResources();
     }
 
@@ -287,7 +365,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
             // Send first goodbye immediately, then let the timer send the second
             transport.Send(DnsEncoder.Encode(BuildGoodbyeMessage()));
             state = AnnounceState.Goodbye1;
-            countdown = 2;
+            countdown = 1;
             ScheduleTimer(500);
         }
     }
@@ -311,6 +389,5 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
         Announce3,
         Ready,
         Goodbye1,
-        Goodbye2,
     }
 }

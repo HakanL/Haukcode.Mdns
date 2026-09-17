@@ -11,8 +11,7 @@ internal sealed class MulticastTransport : IDisposable
     private const int MdnsPort = 5353;
 
     private readonly object mutex = new();
-    private UdpClient[]? clients;       // bound to 5353, receive multicast announcements
-    private UdpClient[]? senders;       // bound to ephemeral, send queries and receive unicast replies
+    private UdpClient[]? clients;       // bound to 5353, one per interface: receive AND send
     private bool disposed;
 
     public event Action<byte[], IPEndPoint>? PacketReceived;
@@ -27,11 +26,8 @@ internal sealed class MulticastTransport : IDisposable
         {
             if (clients != null) return;
             clients = BuildClients();
-            senders = BuildSenderClients();
             foreach (var client in clients)
                 BeginReceive(client);
-            foreach (var sender in senders)
-                BeginReceive(sender);
         }
     }
 
@@ -44,19 +40,70 @@ internal sealed class MulticastTransport : IDisposable
     // Send
     // -------------------------------------------------------------------------
 
+    /// <summary>
+    /// Send a datagram to 224.0.0.251:5353 out of every joined interface.
+    /// </summary>
+    /// <remarks>
+    /// The source port is 5353, because these are the sockets bound to 5353. That is
+    /// not incidental — it is what makes the traffic mDNS at all:
+    ///
+    ///   RFC 6762 §6:   "The source UDP port in all Multicast DNS responses MUST be
+    ///                   5353" and "Multicast DNS implementations MUST silently ignore
+    ///                   any Multicast DNS responses they receive where the source UDP
+    ///                   port is not 5353."
+    ///   RFC 6762 §5.2: "A compliant Multicast DNS querier ... MUST send its Multicast
+    ///                   DNS queries from UDP source port 5353."
+    ///
+    /// This previously sent from a separate set of ephemeral-port sockets, on the
+    /// reasoning that a port only we hold cannot have its unicast replies absorbed by
+    /// a Bonjour/avahi responder already bound to 5353. The cost of that was total:
+    /// every announcement we sent carried a random source port, so a conforming
+    /// receiver — avahi and mDNSResponder both do this — dropped it on the floor. Our
+    /// own browser did not check the port, which is exactly why Core-to-Core discovery
+    /// kept working and hid the fault.
+    ///
+    /// Queries here are QM (no unicast-response bit), so answers come back multicast
+    /// and land on these same group-joined sockets; the absorption worry applied to
+    /// unicast replies, which we do not ask for.
+    /// </remarks>
     public void Send(byte[] datagram)
     {
         var ep = new IPEndPoint(MulticastGroup, MdnsPort);
         lock (mutex)
         {
-            // Send from ephemeral-port sockets so unicast replies come back
-            // to a port only we hold (not Windows Bonjour / avahi / etc.
-            // which already bind 5353 exclusively for unicast).
-            if (senders == null) return;
-            foreach (var sender in senders)
+            if (clients == null) return;
+            foreach (var client in clients)
             {
-                try { sender.Send(datagram, datagram.Length, ep); }
+                try { client.Send(datagram, datagram.Length, ep); }
                 catch (SocketException) { /* interface may have gone away */ }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Send a datagram to one address — the unicast reply path for legacy queriers
+    /// (RFC 6762 §6.7). Source port is 5353, same as every other packet we send.
+    /// </summary>
+    /// <remarks>
+    /// Any of the sockets will do: they are bound to 0.0.0.0:5353, so the kernel picks
+    /// the outbound interface and source address from the routing table for this
+    /// destination. MulticastInterface, which is what differentiates them, applies only
+    /// to multicast. Sending from just one is the point — sending from all of them
+    /// would put N copies of the same reply on the wire.
+    /// </remarks>
+    public void SendTo(byte[] datagram, IPEndPoint destination)
+    {
+        lock (mutex)
+        {
+            if (clients == null) return;
+            foreach (var client in clients)
+            {
+                try
+                {
+                    client.Send(datagram, datagram.Length, destination);
+                    return;
+                }
+                catch (SocketException) { /* try the next socket */ }
             }
         }
     }
@@ -281,49 +328,11 @@ internal sealed class MulticastTransport : IDisposable
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Build one UDP socket per interface, bound to an ephemeral port. These
-    /// sockets are used to SEND queries. Because they bind to a random port,
-    /// unicast replies (to the querier's source address/port) come back to
-    /// us rather than being absorbed by Bonjour / avahi / Windows mDNS also
-    /// bound to 5353.
+    /// Build one UDP socket per interface, bound to 5353 and joined to the mDNS
+    /// group. Every packet we receive arrives on these, and every packet we send
+    /// leaves from these — so the source port is always 5353, as RFC 6762 requires
+    /// of both responses (§6) and compliant queries (§5.2).
     /// </summary>
-    private static UdpClient[] BuildSenderClients()
-    {
-        var result = new List<UdpClient>();
-
-        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
-        {
-            if (!nic.SupportsMulticast) continue;
-            if (nic.OperationalStatus != OperationalStatus.Up) continue;
-            if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
-
-            var ipProps = nic.GetIPProperties();
-            IPv4InterfaceProperties? ipv4Props;
-            try { ipv4Props = ipProps.GetIPv4Properties(); }
-            catch (NetworkInformationException) { continue; }
-            if (ipv4Props == null) continue;
-
-            if (!ipProps.UnicastAddresses.Any(u => u.Address.AddressFamily == AddressFamily.InterNetwork))
-                continue;
-
-            try
-            {
-                // Ephemeral port on this interface. MulticastInterface ensures
-                // outbound multicast packets go out this specific adapter.
-                var client = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
-                client.Client.SetSocketOption(SocketOptionLevel.IP,
-                    SocketOptionName.MulticastInterface,
-                    IPAddress.HostToNetworkOrder(ipv4Props.Index));
-                client.Client.SetSocketOption(SocketOptionLevel.IP,
-                    SocketOptionName.MulticastTimeToLive, 255);
-                result.Add(client);
-            }
-            catch (SocketException) { /* skip interface */ }
-        }
-
-        return result.ToArray();
-    }
-
     private static UdpClient[] BuildClients()
     {
         var result = new List<UdpClient>();
@@ -365,6 +374,13 @@ internal sealed class MulticastTransport : IDisposable
                 socket.Bind(new IPEndPoint(IPAddress.Any, MdnsPort));
                 socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership,
                     new MulticastOption(MulticastGroup, ipv4Props.Index));
+
+                // RFC 6762 §11: multicast DNS packets are sent with IP TTL 255, which
+                // lets a receiver tell a genuine link-local packet from a routed one.
+                // This used to be set on the send-only sockets; it belongs here now
+                // that these sockets do the sending.
+                socket.SetSocketOption(SocketOptionLevel.IP,
+                    SocketOptionName.MulticastTimeToLive, 255);
 
                 result.Add(client);
             }
@@ -465,11 +481,6 @@ internal sealed class MulticastTransport : IDisposable
             {
                 foreach (var c in clients) c.Dispose();
                 clients = null;
-            }
-            if (senders != null)
-            {
-                foreach (var s in senders) s.Dispose();
-                senders = null;
             }
         }
     }
