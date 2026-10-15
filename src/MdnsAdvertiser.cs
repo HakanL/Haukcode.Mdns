@@ -11,6 +11,10 @@ namespace Haukcode.Mdns;
 ///      compliant querier, unicast to a legacy one-shot resolver (§6.7)
 ///   5. Goodbye: re-send with TTL=0 on dispose (x2, 500 ms apart)
 ///
+/// Every multicast announcement is built per interface and carries only that
+/// interface's own addresses, and a query is answered only on the interface it
+/// arrived on — the way Bonjour and avahi behave.
+///
 /// Note: Full name-conflict resolution (RFC 6762 §8) is not implemented.
 /// On a typical LAN with a single DMX controller this is acceptable.
 /// </summary>
@@ -28,15 +32,35 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
 
     private const int MdnsPort = 5353;
 
+    /// <summary>
+    /// RFC 6762 §6: the same record is not multicast on one interface more than once
+    /// per second.
+    /// </summary>
+    private static readonly TimeSpan MinimumAnswerInterval = TimeSpan.FromSeconds(1);
+
     private readonly MulticastTransport transport;
     private readonly ServiceProfile profile;
+
+    /// <summary>
+    /// Every address this host advertises, in preference order. Used when an
+    /// interface cannot be told apart — a legacy reply or a packet whose arrival
+    /// interface the kernel did not report.
+    /// </summary>
     private readonly IReadOnlyList<IPAddress> localAddresses;
+
+    /// <summary>
+    /// The one address to advertise everywhere, when the caller pinned one.
+    /// </summary>
+    private readonly IPAddress? pinnedAddress;
 
     private readonly Timer announceTimer;
     private AnnounceState state = AnnounceState.Idle;
     private int countdown;
     private readonly Stopwatch elapsed = new();
     private int refreshCountdown = 2;
+
+    private readonly Stopwatch clock = Stopwatch.StartNew();
+    private readonly AnswerRateLimiter answerRateLimiter = new(MinimumAnswerInterval);
 
     private bool disposed;
     private readonly object mutex = new();
@@ -54,14 +78,16 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
 
     /// <param name="profile">Service to advertise.</param>
     /// <param name="localAddress">
-    /// Local IPv4 address to include in A records. When null, every local address is
-    /// advertised (see <see cref="MulticastTransport.GetLocalAddresses"/>) so that a
-    /// multi-homed host is reachable from all of its networks; pass an address
-    /// explicitly to advertise on one network only.
+    /// Local IPv4 address to include in A records. When null, each interface
+    /// advertises its own addresses (see <see cref="MulticastTransport.GetLocalAddresses"/>
+    /// for which interfaces qualify) so that a multi-homed host is reachable from all
+    /// of its networks; pass an address explicitly to advertise that one address on
+    /// every interface.
     /// </param>
     public MdnsAdvertiser(ServiceProfile profile, IPAddress? localAddress = null)
     {
         this.profile = profile;
+        this.pinnedAddress = localAddress;
         this.localAddresses = localAddress != null
             ? [localAddress]
             : [.. MulticastTransport.GetLocalAddresses()];
@@ -90,7 +116,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
             transport.Start();
 
             // Probe first (claim packet)
-            transport.Send(DnsEncoder.Encode(BuildClaimMessage()));
+            SendOnEveryInterface(BuildClaimMessage, countsAsAnswer: false);
 
             state = AnnounceState.Announce1;
             countdown = 2;
@@ -120,7 +146,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
                 case AnnounceState.Announce1:
                     if (--countdown == 0)
                     {
-                        transport.Send(DnsEncoder.Encode(BuildAnnounceMessage()));
+                        SendAnnouncementOnEveryInterface();
                         state = AnnounceState.Announce2;
                         countdown = 1;
                     }
@@ -129,7 +155,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
                 case AnnounceState.Announce2:
                     if (--countdown == 0)
                     {
-                        transport.Send(DnsEncoder.Encode(BuildAnnounceMessage()));
+                        SendAnnouncementOnEveryInterface();
                         state = AnnounceState.Announce3;
                         countdown = 4;
                     }
@@ -138,7 +164,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
                 case AnnounceState.Announce3:
                     if (--countdown == 0)
                     {
-                        transport.Send(DnsEncoder.Encode(BuildAnnounceMessage()));
+                        SendAnnouncementOnEveryInterface();
                         state = AnnounceState.Ready;
                         elapsed.Restart();
                         refreshCountdown = 2;
@@ -157,7 +183,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
                     {
                         refreshCountdown = (2 + refreshCountdown) % 3;
                         if (refreshCountdown == 2) elapsed.Restart();
-                        transport.Send(DnsEncoder.Encode(BuildAnnounceMessage()));
+                        SendAnnouncementOnEveryInterface();
                     }
                     break;
 
@@ -186,7 +212,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
     // Respond to incoming PTR queries
     // -------------------------------------------------------------------------
 
-    private void OnPacketReceived(byte[] data, IPEndPoint remote)
+    private void OnPacketReceived(byte[] data, IPEndPoint remote, int interfaceIndex)
     {
         if (!DnsParser.TryParse(data, out var msg) || msg == null || msg.IsResponse)
             return;
@@ -209,13 +235,11 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
                 {
                     if (isLegacyQuerier)
                     {
-                        transport.SendTo(DnsEncoder.Encode(BuildLegacyResponse(q, msg.Id)), remote);
+                        transport.SendTo(DnsEncoder.Encode(BuildLegacyResponse(q, msg.Id, AddressesOn(interfaceIndex))), remote);
                     }
                     else
                     {
-                        // Re-announce immediately
-                        transport.Send(DnsEncoder.Encode(BuildAnnounceMessage()));
-                        elapsed.Restart();
+                        AnswerOn(interfaceIndex);
                     }
                     break;
                 }
@@ -223,11 +247,114 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Multicast the announcement in answer to a query heard on
+    /// <paramref name="interfaceIndex"/>: on that interface only, with that
+    /// interface's addresses, and not within a second of the last one there.
+    /// </summary>
+    private void AnswerOn(int interfaceIndex)
+    {
+        var now = clock.Elapsed;
+
+        if (interfaceIndex == MulticastTransport.UnknownInterface)
+        {
+            // No arrival interface: answer the old way, everywhere, but still no more
+            // than once per second.
+            if (!answerRateLimiter.MayAnswer(interfaceIndex, now))
+                return;
+
+            SendAnnouncementOnEveryInterface();
+            answerRateLimiter.Record(interfaceIndex, now);
+            elapsed.Restart();
+
+            return;
+        }
+
+        if (!answerRateLimiter.MayAnswer(interfaceIndex, now))
+            return;
+
+        var addresses = AddressesOn(interfaceIndex);
+
+        if (addresses.Count == 0)
+            return;
+
+        transport.SendOn(interfaceIndex, DnsEncoder.Encode(BuildAnnounceMessage(addresses)));
+        answerRateLimiter.Record(interfaceIndex, now);
+        elapsed.Restart();
+    }
+
+    /// <summary>
+    /// The addresses to put in a message that leaves on
+    /// <paramref name="interfaceIndex"/>: the pinned address if there is one, else
+    /// that interface's own addresses, else (interface unknown or not ours) every
+    /// local address.
+    /// </summary>
+    private IReadOnlyList<IPAddress> AddressesOn(int interfaceIndex)
+    {
+        if (pinnedAddress != null)
+            return [pinnedAddress];
+
+        if (interfaceIndex == MulticastTransport.UnknownInterface)
+            return localAddresses;
+
+        var adapter = transport.Adapters.FirstOrDefault(x => x.InterfaceIndex == interfaceIndex);
+
+        return adapter == null ? localAddresses : AddressesFor(adapter.Addresses);
+    }
+
+    /// <summary>
+    /// What one interface advertises, given the addresses configured on it.
+    /// </summary>
+    /// <remarks>
+    /// Per-interface A records are what make a multi-homed host honest: a browser on
+    /// the Hyper-V side of a developer PC is told the Hyper-V address, and a browser
+    /// on the wired side the wired one. Handing both sides the full list, as this did
+    /// until now, made Bonjour on the same host list the service once per interface
+    /// with the same first address each time.
+    /// </remarks>
+    internal IReadOnlyList<IPAddress> AddressesFor(IReadOnlyList<IPAddress> interfaceAddresses)
+        => pinnedAddress != null ? [pinnedAddress] : interfaceAddresses;
+
+    /// <summary>
+    /// Multicast the full announcement on every interface, each with its own
+    /// addresses. Used for the unsolicited announcements and TTL refreshes.
+    /// </summary>
+    private void SendAnnouncementOnEveryInterface()
+        => SendOnEveryInterface(BuildAnnounceMessage, countsAsAnswer: true);
+
+    private void SendOnEveryInterface(Func<IReadOnlyList<IPAddress>, DnsMessage> build, bool countsAsAnswer)
+    {
+        var now = clock.Elapsed;
+        bool sentAny = false;
+
+        foreach (var adapter in transport.Adapters)
+        {
+            var addresses = AddressesFor(adapter.Addresses);
+
+            if (addresses.Count == 0)
+                continue;
+
+            transport.SendOn(adapter.InterfaceIndex, DnsEncoder.Encode(build(addresses)));
+
+            if (countsAsAnswer)
+                answerRateLimiter.Record(adapter.InterfaceIndex, now);
+
+            sentAny = true;
+        }
+
+        if (!sentAny)
+        {
+            // Nothing bound with an address of its own (should not happen once Start
+            // succeeded) - fall back to one message with every address, everywhere.
+            transport.Send(DnsEncoder.Encode(build(localAddresses)));
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Message builders
     // -------------------------------------------------------------------------
 
-    private DnsMessage BuildClaimMessage()
+    private DnsMessage BuildClaimMessage(IReadOnlyList<IPAddress> addresses)
     {
         var msg = new DnsMessage { IsResponse = false };
         msg.Questions.Add(new DnsQuestion(profile.FullInstanceName, DnsRecordType.SRV, DnsClass.IN));
@@ -235,7 +362,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
 
         msg.Authorities.Add(new DnsRecord(profile.FullInstanceName, DnsRecordType.SRV, DnsClass.IN, ShortTtl,
             DnsEncoder.BuildSrv(0, 0, profile.Port, profile.Hostname)));
-        foreach (var address in localAddresses)
+        foreach (var address in addresses)
         {
             msg.Authorities.Add(new DnsRecord(profile.Hostname, DnsRecordType.A, DnsClass.IN, ShortTtl,
                 DnsEncoder.BuildA(address)));
@@ -245,7 +372,15 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// The full announcement: PTR, SRV, TXT and one A per local address.
+    /// The full announcement with every local address - what a message carries when
+    /// the interface it leaves on cannot be told.
+    /// </summary>
+    internal DnsMessage BuildAnnounceMessage()
+        => BuildAnnounceMessage(localAddresses);
+
+    /// <summary>
+    /// The full announcement: PTR, SRV, TXT and one A per address in
+    /// <paramref name="addresses"/>.
     /// </summary>
     /// <remarks>
     /// Record order is load-bearing, which is not obvious from the wire format. A
@@ -262,7 +397,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
     /// also the unsolicited announcements, and RFC 6762 §8.3 asks for the newly
     /// registered records in the Answer section. Ordering satisfies both readings.
     /// </remarks>
-    internal DnsMessage BuildAnnounceMessage()
+    internal DnsMessage BuildAnnounceMessage(IReadOnlyList<IPAddress> addresses)
     {
         var msg = new DnsMessage { IsResponse = true, IsAuthoritative = true };
 
@@ -282,9 +417,10 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
         msg.Answers.Add(new DnsRecord(profile.FullInstanceName, DnsRecordType.TXT, DnsClass.IN_Unicast, LongTtl,
             DnsEncoder.BuildTxt(profile.Properties)));
 
-        // A — one per local address, so a client on any of our networks has a
-        // reachable answer rather than only the first interface's address.
-        foreach (var address in localAddresses)
+        // A — one per address of the interface this message leaves on, so a client
+        // on that network is handed an address it can reach and not the ones on
+        // the host's other networks.
+        foreach (var address in addresses)
         {
             msg.Answers.Add(new DnsRecord(profile.Hostname, DnsRecordType.A, DnsClass.IN_Unicast, ShortTtl,
                 DnsEncoder.BuildA(address)));
@@ -292,6 +428,13 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
 
         return msg;
     }
+
+    /// <summary>
+    /// The unicast answer to a legacy one-shot query (RFC 6762 §6.7), carrying every
+    /// local address.
+    /// </summary>
+    internal DnsMessage BuildLegacyResponse(DnsQuestion question, ushort queryId)
+        => BuildLegacyResponse(question, queryId, localAddresses);
 
     /// <summary>
     /// Build the unicast answer to a legacy one-shot query (RFC 6762 §6.7).
@@ -312,7 +455,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
     /// to actually reach the service rides along in Additionals, so a one-shot browse
     /// resolves in a single round trip.
     /// </remarks>
-    internal DnsMessage BuildLegacyResponse(DnsQuestion question, ushort queryId)
+    internal DnsMessage BuildLegacyResponse(DnsQuestion question, ushort queryId, IReadOnlyList<IPAddress> addresses)
     {
         var msg = new DnsMessage { Id = queryId, IsResponse = true, IsAuthoritative = true };
 
@@ -327,7 +470,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
         msg.Additionals.Add(new DnsRecord(profile.FullInstanceName, DnsRecordType.TXT, DnsClass.IN, LegacyTtl,
             DnsEncoder.BuildTxt(profile.Properties)));
 
-        foreach (var address in localAddresses)
+        foreach (var address in addresses)
         {
             msg.Additionals.Add(new DnsRecord(profile.Hostname, DnsRecordType.A, DnsClass.IN, LegacyTtl,
                 DnsEncoder.BuildA(address)));

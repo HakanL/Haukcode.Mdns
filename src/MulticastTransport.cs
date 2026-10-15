@@ -10,11 +10,32 @@ internal sealed class MulticastTransport : IDisposable
     private static readonly IPAddress MulticastGroup = IPAddress.Parse("224.0.0.251");
     private const int MdnsPort = 5353;
 
+    /// <summary>
+    /// Interface index handed to <see cref="PacketReceived"/> when the kernel did not
+    /// say which interface a packet arrived on. Answers to such a packet go out on
+    /// every interface, as they did before arrival interfaces were tracked.
+    /// </summary>
+    public const int UnknownInterface = -1;
+
     private readonly object mutex = new();
-    private UdpClient[]? clients;       // bound to 5353, one per interface: receive AND send
+    private BoundAdapter[]? clients;    // bound to 5353, one per interface: receive AND send
     private bool disposed;
 
-    public event Action<byte[], IPEndPoint>? PacketReceived;
+    /// <summary>
+    /// A packet, its sender, and the index of the interface it arrived on
+    /// (<see cref="UnknownInterface"/> when that could not be determined).
+    /// </summary>
+    public event Action<byte[], IPEndPoint, int>? PacketReceived;
+
+    /// <summary>
+    /// One network interface this transport sends and receives on.
+    /// </summary>
+    /// <param name="InterfaceIndex">The OS interface index, as IP_PKTINFO reports it.</param>
+    /// <param name="Name">The adapter name, for diagnostics.</param>
+    /// <param name="Addresses">The IPv4 addresses configured on that interface.</param>
+    public sealed record Adapter(int InterfaceIndex, string Name, IReadOnlyList<IPAddress> Addresses);
+
+    private sealed record BoundAdapter(UdpClient Client, Adapter Adapter);
 
     // -------------------------------------------------------------------------
     // Start / Stop
@@ -34,6 +55,19 @@ internal sealed class MulticastTransport : IDisposable
     public int AdapterCount
     {
         get { lock (mutex) return clients?.Length ?? 0; }
+    }
+
+    /// <summary>
+    /// The interfaces this transport is bound to, with their addresses. Empty before
+    /// <see cref="Start"/>.
+    /// </summary>
+    public IReadOnlyList<Adapter> Adapters
+    {
+        get
+        {
+            lock (mutex)
+                return clients?.Select(x => x.Adapter).ToArray() ?? [];
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -74,9 +108,48 @@ internal sealed class MulticastTransport : IDisposable
             if (clients == null) return;
             foreach (var client in clients)
             {
-                try { client.Send(datagram, datagram.Length, ep); }
+                try { client.Client.Send(datagram, datagram.Length, ep); }
                 catch (SocketException) { /* interface may have gone away */ }
             }
+        }
+    }
+
+    /// <summary>
+    /// Send a datagram to 224.0.0.251:5353 out of one interface only. Falls back to
+    /// <see cref="Send"/> when the index is <see cref="UnknownInterface"/> or names an
+    /// interface this transport is not bound to.
+    /// </summary>
+    /// <remarks>
+    /// This is how a response stays on the link the question came from. A query heard
+    /// on one interface and answered on all of them puts the same records on every
+    /// network the host touches, and a browser on the same host — Bonjour keeps its
+    /// cache per interface — then reports the service once per interface it heard it
+    /// on. That is what a user sees as the same device listed twice.
+    /// </remarks>
+    public void SendOn(int interfaceIndex, byte[] datagram)
+    {
+        var ep = new IPEndPoint(MulticastGroup, MdnsPort);
+        lock (mutex)
+        {
+            if (clients == null) return;
+
+            var target = interfaceIndex == UnknownInterface
+                ? null
+                : clients.FirstOrDefault(x => x.Adapter.InterfaceIndex == interfaceIndex);
+
+            if (target == null)
+            {
+                foreach (var client in clients)
+                {
+                    try { client.Client.Send(datagram, datagram.Length, ep); }
+                    catch (SocketException) { /* interface may have gone away */ }
+                }
+
+                return;
+            }
+
+            try { target.Client.Send(datagram, datagram.Length, ep); }
+            catch (SocketException) { /* interface may have gone away */ }
         }
     }
 
@@ -100,7 +173,7 @@ internal sealed class MulticastTransport : IDisposable
             {
                 try
                 {
-                    client.Send(datagram, datagram.Length, destination);
+                    client.Client.Send(datagram, datagram.Length, destination);
                     return;
                 }
                 catch (SocketException) { /* try the next socket */ }
@@ -153,12 +226,8 @@ internal sealed class MulticastTransport : IDisposable
             bool isVirtual = IsLikelyVirtual(nic);
             bool isWifi = nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211;
 
-            foreach (var ua in nic.GetIPProperties().UnicastAddresses)
+            foreach (var ip in UnicastIPv4Addresses(nic))
             {
-                var ip = ua.Address;
-                if (ip.AddressFamily != AddressFamily.InterNetwork) continue;
-                if (IPAddress.IsLoopback(ip)) continue;
-
                 if (isVirtual)
                     virtualAddresses?.Add(ip);
 
@@ -172,6 +241,25 @@ internal sealed class MulticastTransport : IDisposable
         ethernet.AddRange(virtualEthernet);
         wifi.AddRange(physicalWifi);
         wifi.AddRange(virtualWifi);
+    }
+
+    /// <summary>
+    /// The IPv4 addresses configured on one interface, loopback excluded.
+    /// </summary>
+    private static List<IPAddress> UnicastIPv4Addresses(NetworkInterface nic)
+    {
+        var result = new List<IPAddress>();
+
+        foreach (var ua in nic.GetIPProperties().UnicastAddresses)
+        {
+            var ip = ua.Address;
+            if (ip.AddressFamily != AddressFamily.InterNetwork) continue;
+            if (IPAddress.IsLoopback(ip)) continue;
+
+            result.Add(ip);
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -333,15 +421,22 @@ internal sealed class MulticastTransport : IDisposable
     /// leaves from these — so the source port is always 5353, as RFC 6762 requires
     /// of both responses (§6) and compliant queries (§5.2).
     /// </summary>
-    private static UdpClient[] BuildClients()
+    /// <remarks>
+    /// Point-to-point links are skipped here for the same reason
+    /// <see cref="GetLocalAddresses"/> leaves their addresses out: a tunnel has no
+    /// multicast neighbours, so a socket joined on it would never hear a query and
+    /// would only put our announcements on a link where nothing can use them.
+    /// </remarks>
+    private static BoundAdapter[] BuildClients()
     {
-        var result = new List<UdpClient>();
+        var result = new List<BoundAdapter>();
 
         foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
         {
             if (!nic.SupportsMulticast) continue;
             if (nic.OperationalStatus != OperationalStatus.Up) continue;
             if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+            if (IsPointToPoint(nic)) continue;
 
             var ipProps = nic.GetIPProperties();
             IPv4InterfaceProperties? ipv4Props;
@@ -357,7 +452,9 @@ internal sealed class MulticastTransport : IDisposable
             }
             if (ipv4Props == null) continue;
 
-            if (!ipProps.UnicastAddresses.Any(u => u.Address.AddressFamily == AddressFamily.InterNetwork))
+            var addresses = UnicastIPv4Addresses(nic);
+
+            if (addresses.Count == 0)
                 continue;
 
             try
@@ -382,7 +479,19 @@ internal sealed class MulticastTransport : IDisposable
                 socket.SetSocketOption(SocketOptionLevel.IP,
                     SocketOptionName.MulticastTimeToLive, 255);
 
-                result.Add(client);
+                // IP_PKTINFO, so the receive loop learns which interface each packet
+                // came in on. The runtime enables this itself for ReceiveMessageFrom;
+                // asking for it here as well costs nothing and documents the dependency.
+                try
+                {
+                    socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.PacketInformation, true);
+                }
+                catch (SocketException)
+                {
+                    // Arrival interfaces will come back as unknown on this socket
+                }
+
+                result.Add(new BoundAdapter(client, new Adapter(ipv4Props.Index, nic.Name, addresses)));
             }
             catch (SocketException)
             {
@@ -400,10 +509,27 @@ internal sealed class MulticastTransport : IDisposable
     // Receive loop
     // -------------------------------------------------------------------------
 
-    private void BeginReceive(UdpClient client)
+    private void BeginReceive(BoundAdapter client)
     {
         _ = ReceiveLoopAsync(client);
     }
+
+    /// <summary>
+    /// Whether the socket joined on <paramref name="socketInterface"/> should handle a
+    /// packet that arrived on <paramref name="arrivalInterface"/>.
+    /// </summary>
+    /// <remarks>
+    /// Every socket here is bound to 0.0.0.0:5353, and Windows hands a multicast
+    /// datagram to every such socket that joined the group, whichever interface it
+    /// came in on. Left alone, one query is therefore received N times, and a
+    /// responder that answers each copy on every interface puts N copies of the same
+    /// answer on each link — observed as three identical responses within 6 ms to a
+    /// single Bonjour browse. Each socket keeps only the packets from its own
+    /// interface, so a packet is handled exactly once. When the kernel did not say
+    /// where the packet came from, it is kept, as it always was.
+    /// </remarks>
+    internal static bool AcceptsPacket(int socketInterface, int arrivalInterface)
+        => arrivalInterface <= 0 || arrivalInterface == socketInterface;
 
     /// <summary>
     /// Persistent receive loop for one socket. Replaces the earlier
@@ -417,18 +543,24 @@ internal sealed class MulticastTransport : IDisposable
     /// path either exits because we are disposed or iterates and receives
     /// again.
     /// </summary>
-    private async Task ReceiveLoopAsync(UdpClient client)
+    private async Task ReceiveLoopAsync(BoundAdapter bound)
     {
+        var socket = bound.Client.Client;
+        var buffer = new byte[9000];
+        EndPoint anyEndpoint = new IPEndPoint(IPAddress.Any, 0);
+
         while (true)
         {
             byte[] data;
             IPEndPoint remote;
+            int arrivalInterface;
 
             try
             {
-                var result = await client.ReceiveAsync().ConfigureAwait(false);
-                data = result.Buffer;
-                remote = result.RemoteEndPoint;
+                var result = await socket.ReceiveMessageFromAsync(buffer, SocketFlags.None, anyEndpoint).ConfigureAwait(false);
+                data = buffer.AsSpan(0, result.ReceivedBytes).ToArray();
+                remote = (IPEndPoint)result.RemoteEndPoint;
+                arrivalInterface = result.PacketInformation.Interface;
             }
             catch (ObjectDisposedException)
             {
@@ -455,9 +587,12 @@ internal sealed class MulticastTransport : IDisposable
                 if (disposed) return;
             }
 
+            if (!AcceptsPacket(bound.Adapter.InterfaceIndex, arrivalInterface))
+                continue;
+
             try
             {
-                PacketReceived?.Invoke(data, remote);
+                PacketReceived?.Invoke(data, remote, arrivalInterface > 0 ? arrivalInterface : UnknownInterface);
             }
             catch
             {
@@ -479,7 +614,7 @@ internal sealed class MulticastTransport : IDisposable
 
             if (clients != null)
             {
-                foreach (var c in clients) c.Dispose();
+                foreach (var c in clients) c.Client.Dispose();
                 clients = null;
             }
         }

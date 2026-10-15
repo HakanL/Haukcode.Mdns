@@ -7,6 +7,8 @@ Lightweight mDNS (RFC 6762) and DNS-SD (RFC 6763) for .NET — zero external dep
 - **Advertise** a service so other devices can discover it via mDNS
 - **Browse** for services on the local network
 - Multi-adapter multicast — binds to all suitable network interfaces
+- Per-interface answers: a query is answered only on the interface it arrived on, with that interface's own addresses, like Bonjour and avahi
+- Answers are rate-limited to once per second per interface (§6)
 - RFC-compliant announce sequence, TTL refresh, and goodbye packets
 - Cross-platform: Windows, Linux ARM64, macOS
 

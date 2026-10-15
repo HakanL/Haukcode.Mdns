@@ -151,7 +151,7 @@ public sealed class MdnsBrowser : IDisposable, IAsyncDisposable
     internal bool ShouldIgnoreResponseFrom(int sourcePort)
         => !acceptResponsesFromAnyPort && sourcePort != MdnsPort;
 
-    private void OnPacketReceived(byte[] data, IPEndPoint remote)
+    private void OnPacketReceived(byte[] data, IPEndPoint remote, int interfaceIndex)
     {
         if (!DnsParser.TryParse(data, out var msg) || msg == null || !msg.IsResponse)
             return;
