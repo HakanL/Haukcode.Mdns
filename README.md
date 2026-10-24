@@ -88,6 +88,10 @@ The advertiser follows the RFC 6762 announcement sequence:
    echoes the query ID and question, omits the cache-flush bit, and caps TTLs at 10 s (§6.7)
 5. **Goodbye** — re-sends with TTL=0 on dispose (x2, 500 ms apart)
 
+## Used in production
+
+This library is used in [DMX Core 100](https://dmxcore.com), a DMX lighting controller for permanent installations that runs on Windows, macOS and Linux, or on its own touchscreen hardware. There it advertises each unit on the local network and finds network devices to connect to.
+
 ## Links
 
 - [RFC 6762 — mDNS](https://datatracker.ietf.org/doc/html/rfc6762)
