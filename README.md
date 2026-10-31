@@ -15,6 +15,8 @@ Lightweight mDNS (RFC 6762) and DNS-SD (RFC 6763) for .NET — zero external dep
 - RFC-compliant announce sequence, TTL refresh, and goodbye packets
 - All traffic sent from UDP port 5353, as RFC 6762 requires of responses (§6) and compliant queries (§5.2)
 - Answers legacy one-shot resolvers by unicast (§6.7)
+- Answers every question for a name it holds (§6): the service type's PTR, the instance's SRV and TXT, and the host name's A record
+- The host name in the SRV target and A records can be the machine's own, not only one derived from the instance name
 - Cross-platform: Windows, Linux ARM64, macOS
 - No external dependencies
 
@@ -50,6 +52,22 @@ browser.ServiceLost += svc =>
 browser.Start();
 ```
 
+### Advertise under the machine's host name
+
+By default the SRV target and the A records use a host name derived from the
+instance name (`My-Device.local.`). Pass `hostname` to use the machine's own name
+instead, so the service resolves to the same name the OS responder (Bonjour, avahi)
+answers for, and the advertiser answers A queries for it on hosts that have no
+OS responder at all:
+
+```csharp
+var profile = new ServiceProfile("My Device", "_http._tcp", port: 80, hostname: Dns.GetHostName());
+// SRV → <hostname>.local., A records named <hostname>.local.
+```
+
+A trailing `.local` is dropped and the label is sanitised like the instance name
+(letters, digits and hyphens only).
+
 ### Source-port strictness
 
 RFC 6762 §6 requires an implementation to silently ignore responses whose source
@@ -74,7 +92,7 @@ using var browser = new MdnsBrowser("_http._tcp", acceptResponsesFromAnyPort: tr
 | `Properties` | `{ "txtvers": "1" }` |
 | `FullServiceType` | `_http._tcp.local.` |
 | `FullInstanceName` | `My Device._http._tcp.local.` |
-| `Hostname` | `My-Device.local.` |
+| `Hostname` | `My-Device.local.` — or `<hostname>.local.` when one is given |
 
 ## Announce sequence
 
@@ -83,9 +101,12 @@ The advertiser follows the RFC 6762 announcement sequence:
 1. **Probe** — sends a claim packet (SRV + A in the Authority section)
 2. **Announce x3** — sends full response (PTR + SRV + TXT + A) with 500 ms / 1 s / 4 s intervals
 3. **Steady state** — re-announces at 50%, 90%, and 95% of the PTR TTL (4500 s)
-4. **Responds** to incoming PTR queries for the service type — multicast to a compliant
-   querier; to a legacy one-shot resolver (source port ≠ 5353), a unicast reply that
-   echoes the query ID and question, omits the cache-flush bit, and caps TTLs at 10 s (§6.7)
+4. **Responds** to incoming queries for any record it holds — PTR for the service type,
+   SRV or TXT for the instance, A for the host name (§6). A question about the service
+   gets the whole announcement, an A question only the A records. Multicast to a
+   compliant querier; to a legacy one-shot resolver (source port ≠ 5353), a unicast
+   reply that echoes the query ID and question, omits the cache-flush bit, and caps
+   TTLs at 10 s (§6.7)
 5. **Goodbye** — re-sends with TTL=0 on dispose (x2, 500 ms apart)
 
 ## Used in production

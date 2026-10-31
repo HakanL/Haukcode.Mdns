@@ -7,8 +7,10 @@ namespace Haukcode.Mdns;
 ///   1. Probe: send claim packet with SRV+A in the Authority section
 ///   2. Announce x3: send full response with PTR+SRV+TXT+A
 ///   3. Steady state: re-announce at 50%, 90%, 95% of TTL
-///   4. Respond to incoming PTR queries for the service type — multicast to a
-///      compliant querier, unicast to a legacy one-shot resolver (§6.7)
+///   4. Respond to incoming queries for any record it holds — PTR for the
+///      service type, SRV/TXT for the instance, A for the host name (§6) —
+///      multicast to a compliant querier, unicast to a legacy one-shot
+///      resolver (§6.7)
 ///   5. Goodbye: re-send with TTL=0 on dispose (x2, 500 ms apart)
 ///
 /// Every multicast announcement is built per interface and carries only that
@@ -209,7 +211,7 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
         => announceTimer.Change(ms, Timeout.Infinite);
 
     // -------------------------------------------------------------------------
-    // Respond to incoming PTR queries
+    // Respond to incoming queries
     // -------------------------------------------------------------------------
 
     private void OnPacketReceived(byte[] data, IPEndPoint remote, int interfaceIndex)
@@ -228,59 +230,98 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
         {
             if (state != AnnounceState.Ready) return;
 
-            foreach (var q in msg.Questions)
+            var ours = msg.Questions
+                .Select(q => (question: q, subject: SubjectOf(q)))
+                .Where(x => x.subject != Subject.None)
+                .ToList();
+
+            if (ours.Count == 0)
+                return;
+
+            if (isLegacyQuerier)
             {
-                if (q.Type == DnsRecordType.PTR &&
-                    string.Equals(q.Name, profile.FullServiceType, StringComparison.OrdinalIgnoreCase))
-                {
-                    if (isLegacyQuerier)
-                    {
-                        transport.SendTo(DnsEncoder.Encode(BuildLegacyResponse(q, msg.Id, AddressesOn(interfaceIndex))), remote);
-                    }
-                    else
-                    {
-                        AnswerOn(interfaceIndex);
-                    }
-                    break;
-                }
+                // A one-shot resolver sends one question and parses the reply as
+                // ordinary DNS, where a reply answers one question: the first of ours.
+                transport.SendTo(DnsEncoder.Encode(BuildLegacyResponse(ours[0].question, msg.Id, AddressesOn(interfaceIndex))), remote);
+            }
+            else
+            {
+                // Anything about the service gets the whole announcement, which
+                // carries the A records too; the host name alone gets just those.
+                AnswerOn(interfaceIndex, hostOnly: ours.All(x => x.subject == Subject.Host));
             }
         }
     }
 
     /// <summary>
-    /// Multicast the announcement in answer to a query heard on
-    /// <paramref name="interfaceIndex"/>: on that interface only, with that
-    /// interface's addresses, and not within a second of the last one there.
+    /// What a question asks us for, if anything. A responder answers every question
+    /// for a name it holds (RFC 6762 §6), not only the browse for its service type:
+    /// a client that already has the instance name resolves it with SRV and TXT
+    /// questions, and one that has the host name with an A question — queries this
+    /// advertiser ignored until 1.1, leaving the host name unresolvable wherever no
+    /// OS responder (Bonjour, avahi) held it too.
     /// </summary>
-    private void AnswerOn(int interfaceIndex)
+    internal Subject SubjectOf(DnsQuestion question)
+    {
+        if (question.Type == DnsRecordType.PTR && IsName(question.Name, profile.FullServiceType))
+            return Subject.Service;
+
+        if ((question.Type == DnsRecordType.SRV || question.Type == DnsRecordType.TXT) && IsName(question.Name, profile.FullInstanceName))
+            return Subject.Instance;
+
+        if (question.Type == DnsRecordType.A && IsName(question.Name, profile.Hostname))
+            return Subject.Host;
+
+        return Subject.None;
+    }
+
+    private static bool IsName(string name, string ours)
+        => string.Equals(name, ours, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Multicast an answer to a query heard on <paramref name="interfaceIndex"/>:
+    /// on that interface only, with that interface's addresses, and not within a
+    /// second of the last one there. The answer is the whole announcement, or only
+    /// the A records when <paramref name="hostOnly"/>.
+    /// </summary>
+    /// <remarks>
+    /// The rate limiter counts the announcement as one unit per interface (see
+    /// <see cref="AnswerRateLimiter"/>), and an A-only answer is charged against
+    /// the same unit: a querier that just heard the A records on that interface
+    /// has what it asked for, and one that asks for the service within the same
+    /// second heard the announcement that was sent at most a second earlier.
+    /// </remarks>
+    private void AnswerOn(int interfaceIndex, bool hostOnly)
     {
         var now = clock.Elapsed;
+
+        if (!answerRateLimiter.MayAnswer(interfaceIndex, now))
+            return;
+
+        Func<IReadOnlyList<IPAddress>, DnsMessage> build = hostOnly ? BuildAddressMessage : BuildAnnounceMessage;
 
         if (interfaceIndex == MulticastTransport.UnknownInterface)
         {
             // No arrival interface: answer the old way, everywhere, but still no more
             // than once per second.
-            if (!answerRateLimiter.MayAnswer(interfaceIndex, now))
+            SendOnEveryInterface(build, countsAsAnswer: true);
+        }
+        else
+        {
+            var addresses = AddressesOn(interfaceIndex);
+
+            if (addresses.Count == 0)
                 return;
 
-            SendAnnouncementOnEveryInterface();
-            answerRateLimiter.Record(interfaceIndex, now);
-            elapsed.Restart();
-
-            return;
+            transport.SendOn(interfaceIndex, DnsEncoder.Encode(build(addresses)));
         }
 
-        if (!answerRateLimiter.MayAnswer(interfaceIndex, now))
-            return;
-
-        var addresses = AddressesOn(interfaceIndex);
-
-        if (addresses.Count == 0)
-            return;
-
-        transport.SendOn(interfaceIndex, DnsEncoder.Encode(BuildAnnounceMessage(addresses)));
         answerRateLimiter.Record(interfaceIndex, now);
-        elapsed.Restart();
+
+        // The whole announcement refreshes every record and restarts the TTL
+        // refresh schedule; an answer that carried only the A records does not.
+        if (!hostOnly)
+            elapsed.Restart();
     }
 
     /// <summary>
@@ -430,6 +471,23 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// The answer to a query for the host name alone: one A record per address in
+    /// <paramref name="addresses"/>, cache-flush set, and nothing about the service.
+    /// </summary>
+    internal DnsMessage BuildAddressMessage(IReadOnlyList<IPAddress> addresses)
+    {
+        var msg = new DnsMessage { IsResponse = true, IsAuthoritative = true };
+
+        foreach (var address in addresses)
+        {
+            msg.Answers.Add(new DnsRecord(profile.Hostname, DnsRecordType.A, DnsClass.IN_Unicast, ShortTtl,
+                DnsEncoder.BuildA(address)));
+        }
+
+        return msg;
+    }
+
+    /// <summary>
     /// The unicast answer to a legacy one-shot query (RFC 6762 §6.7), carrying every
     /// local address.
     /// </summary>
@@ -451,9 +509,10 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
     ///     discarded as unknown;
     ///   * every TTL is capped at <see cref="LegacyTtl"/> seconds.
     ///
-    /// The answer to the PTR question goes in the Answer section and everything needed
-    /// to actually reach the service rides along in Additionals, so a one-shot browse
-    /// resolves in a single round trip.
+    /// The record that answers the question goes in the Answer section and
+    /// everything else needed to actually reach the service rides along in
+    /// Additionals, so a one-shot browse or resolve completes in a single round
+    /// trip. An A question is answered with the A records alone.
     /// </remarks>
     internal DnsMessage BuildLegacyResponse(DnsQuestion question, ushort queryId, IReadOnlyList<IPAddress> addresses)
     {
@@ -461,19 +520,42 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
 
         msg.Questions.Add(question);
 
-        msg.Answers.Add(new DnsRecord(profile.FullServiceType, DnsRecordType.PTR, DnsClass.IN, LegacyTtl,
-            DnsEncoder.BuildPtr(profile.FullInstanceName)));
+        var ptr = new DnsRecord(profile.FullServiceType, DnsRecordType.PTR, DnsClass.IN, LegacyTtl,
+            DnsEncoder.BuildPtr(profile.FullInstanceName));
 
-        msg.Additionals.Add(new DnsRecord(profile.FullInstanceName, DnsRecordType.SRV, DnsClass.IN, LegacyTtl,
-            DnsEncoder.BuildSrv(0, 0, profile.Port, profile.Hostname)));
+        var srv = new DnsRecord(profile.FullInstanceName, DnsRecordType.SRV, DnsClass.IN, LegacyTtl,
+            DnsEncoder.BuildSrv(0, 0, profile.Port, profile.Hostname));
 
-        msg.Additionals.Add(new DnsRecord(profile.FullInstanceName, DnsRecordType.TXT, DnsClass.IN, LegacyTtl,
-            DnsEncoder.BuildTxt(profile.Properties)));
+        var txt = new DnsRecord(profile.FullInstanceName, DnsRecordType.TXT, DnsClass.IN, LegacyTtl,
+            DnsEncoder.BuildTxt(profile.Properties));
 
-        foreach (var address in addresses)
+        var a = addresses
+            .Select(address => new DnsRecord(profile.Hostname, DnsRecordType.A, DnsClass.IN, LegacyTtl,
+                DnsEncoder.BuildA(address)))
+            .ToList();
+
+        switch (SubjectOf(question))
         {
-            msg.Additionals.Add(new DnsRecord(profile.Hostname, DnsRecordType.A, DnsClass.IN, LegacyTtl,
-                DnsEncoder.BuildA(address)));
+            case Subject.Service:
+                msg.Answers.Add(ptr);
+                msg.Additionals.Add(srv);
+                msg.Additionals.Add(txt);
+                msg.Additionals.AddRange(a);
+                break;
+
+            case Subject.Instance:
+                bool askedSrv = question.Type == DnsRecordType.SRV;
+                msg.Answers.Add(askedSrv ? srv : txt);
+                msg.Additionals.Add(askedSrv ? txt : srv);
+                msg.Additionals.AddRange(a);
+                break;
+
+            case Subject.Host:
+                msg.Answers.AddRange(a);
+                break;
+
+            default:
+                throw new ArgumentException($"Not a question this advertiser answers: {question.Type} {question.Name}", nameof(question));
         }
 
         return msg;
@@ -541,6 +623,15 @@ public sealed class MdnsAdvertiser : IDisposable, IAsyncDisposable
     // -------------------------------------------------------------------------
     // State machine
     // -------------------------------------------------------------------------
+
+    /// <summary>Which of our names a question is about.</summary>
+    internal enum Subject
+    {
+        None,
+        Service,
+        Instance,
+        Host,
+    }
 
     private enum AnnounceState
     {

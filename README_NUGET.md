@@ -10,6 +10,8 @@ Lightweight mDNS (RFC 6762) and DNS-SD (RFC 6763) for .NET — zero external dep
 - Per-interface answers: a query is answered only on the interface it arrived on, with that interface's own addresses, like Bonjour and avahi
 - Answers are rate-limited to once per second per interface (§6)
 - RFC-compliant announce sequence, TTL refresh, and goodbye packets
+- Answers PTR, SRV, TXT and A questions for its own names (§6), by multicast or by unicast to a legacy one-shot resolver (§6.7)
+- Optional `hostname` on `ServiceProfile` to advertise under the machine's own host name
 - Cross-platform: Windows, Linux ARM64, macOS
 
 ## Installation

@@ -43,6 +43,12 @@ public sealed class ServiceProfile
     public IReadOnlyList<IPAddress> Addresses { get; internal set; } = [];
 
     /// <summary>
+    /// The host name given to the constructor, before sanitising and without any
+    /// ".local" suffix; null when the host name is derived from the instance name.
+    /// </summary>
+    private readonly string? hostname;
+
+    /// <summary>
     /// Fully-qualified service type: "_apple-midi._udp.local."
     /// </summary>
     public string FullServiceType => $"{ServiceType}.local.";
@@ -54,18 +60,33 @@ public sealed class ServiceProfile
 
     /// <summary>
     /// Hostname used in SRV records: "DMX-Core-100.local."
+    /// Derived from <see cref="InstanceName"/>, unless a host name was given to the
+    /// constructor — then that one, so the SRV target can be the machine's real
+    /// name, the one the OS resolver (Bonjour, avahi) answers for as well.
     /// Per RFC 6763 §4.3, the label must consist only of letters, digits, and hyphens.
     /// All other characters are replaced with hyphens, and leading/trailing hyphens are removed.
     /// </summary>
-    public string Hostname => $"{SanitizeHostLabel(InstanceName)}.local.";
+    public string Hostname => $"{SanitizeHostLabel(hostname ?? InstanceName)}.local.";
 
+    /// <param name="instanceName">Human-readable instance name, e.g. "DMX Core 100".</param>
+    /// <param name="serviceType">Service type including protocol, e.g. "_http._tcp".</param>
+    /// <param name="port">Port the service listens on.</param>
+    /// <param name="properties">Optional TXT record key/value pairs.</param>
+    /// <param name="hostname">
+    /// Host name to advertise the A records under and point the SRV record at, as a
+    /// single label ("dmxcore-1234") or with the ".local" suffix ("dmxcore-1234.local",
+    /// as <c>Dns.GetHostName()</c> may return it); the suffix is dropped and the label
+    /// sanitised the same way as the instance name. Null derives the host name from
+    /// <paramref name="instanceName"/>.
+    /// </param>
     public ServiceProfile(string instanceName, string serviceType, ushort port,
-        IReadOnlyDictionary<string, string>? properties = null)
+        IReadOnlyDictionary<string, string>? properties = null, string? hostname = null)
     {
-        InstanceName = instanceName;
-        ServiceType  = serviceType;
-        Port         = port;
-        Properties   = properties ?? new Dictionary<string, string>();
+        InstanceName  = instanceName;
+        ServiceType   = serviceType;
+        Port          = port;
+        Properties    = properties ?? new Dictionary<string, string>();
+        this.hostname = hostname == null ? null : TrimLocalSuffix(hostname);
     }
 
     /// <summary>
@@ -99,5 +120,20 @@ public sealed class ServiceProfile
             sb.Length--;
 
         return sb.Length > 0 ? sb.ToString() : "device";
+    }
+
+    /// <summary>
+    /// "dmxcore-1234.local." and "dmxcore-1234.local" → "dmxcore-1234". Without this
+    /// the dot would be sanitised into a hyphen and the name advertised would be
+    /// "dmxcore-1234-local.local.".
+    /// </summary>
+    private static string TrimLocalSuffix(string hostname)
+    {
+        var trimmed = hostname.TrimEnd('.');
+
+        if (trimmed.EndsWith(".local", StringComparison.OrdinalIgnoreCase))
+            trimmed = trimmed[..^".local".Length];
+
+        return trimmed;
     }
 }
